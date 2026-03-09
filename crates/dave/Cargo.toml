@@ -13,4 +13,4 @@ serde_json.workspace = true
 tokio.workspace = true
 serde.workspace = true
 thiserror.workspace = true
-davey = { path = "../../../Neko_Stream/services/discord-bridge/vendor-davey/davey" }
+davey = { path = "../../vendor/davey" }

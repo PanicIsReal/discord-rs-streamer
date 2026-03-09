@@ -206,6 +206,10 @@ where
         &self.state
     }
 
+    pub fn state_mut(&mut self) -> &mut VoiceSessionState {
+        &mut self.state
+    }
+
     pub fn prepare_session(&mut self, info: VoiceServerInfo, config: VoiceSessionConfig) {
         self.state.server_endpoint = Some(info.endpoint);
         self.state.server_token = Some(info.token);
@@ -342,7 +346,7 @@ where
                     .as_ref()
                     .map(|ack| ack.dave_protocol_version)
                     .unwrap_or_default();
-                self.ensure_dave_session(self.state.dave_protocol_version)?;
+                self.reinitialize_dave_session(self.state.dave_protocol_version)?;
                 Ok(vec![VoiceOutbound::Binary(self.key_package_message()?)])
             }
             VOICE_OPCODE_CLIENTS_CONNECT => {
@@ -393,7 +397,7 @@ where
                 let protocol_version = read_u16(&data, "protocol_version")?;
                 if epoch == 1 {
                     self.state.dave_protocol_version = protocol_version;
-                    self.ensure_dave_session(protocol_version)?;
+                    self.reinitialize_dave_session(protocol_version)?;
                     Ok(vec![VoiceOutbound::Binary(self.key_package_message()?)])
                 } else {
                     Ok(Vec::new())
@@ -438,19 +442,25 @@ where
                     ));
                 }
                 let operation = match payload[3] {
-                    1 => ProposalOp::Append,
-                    2 => ProposalOp::Revoke,
+                    0 => ProposalOp::Append,
+                    1 => ProposalOp::Revoke,
                     value => {
                         return Err(VoiceError::InvalidPayload(format!(
                             "unsupported proposal operation {value}"
                         )));
                     }
                 };
-                let result = self
-                    .dave
-                    .process_proposals_bundle(operation, &payload[4..])
-                    .map_err(|error| VoiceError::Dave(error.to_string()))?;
-                Ok(encode_commit_welcome(result))
+                match self.dave.process_proposals_bundle(
+                    operation,
+                    &payload[4..],
+                    self.expected_user_ids().as_deref(),
+                ) {
+                    Ok(result) => Ok(encode_commit_welcome(result)),
+                    Err(error) => {
+                        debug!(error = %error, "recovering from MLS proposals failure");
+                        self.proposals_recovery()
+                    }
+                }
             }
             VOICE_BINARY_OPCODE_COMMIT_TRANSITION => {
                 if payload.len() < 5 {
@@ -459,22 +469,11 @@ where
                     ));
                 }
                 let transition_id = u16::from_be_bytes([payload[3], payload[4]]);
-                match self.dave.process_commit(&payload[5..]) {
-                    Ok(_) => {
-                        if transition_id != 0 {
-                            self.state
-                                .pending_transitions
-                                .insert(transition_id, self.state.dave_protocol_version);
-                            Ok(vec![VoiceOutbound::Json(json!({
-                                "op": VoiceOpcode::DaveTransitionReady as u8,
-                                "d": { "transition_id": transition_id }
-                            }))])
-                        } else {
-                            Ok(Vec::new())
-                        }
-                    }
-                    Err(_) => self.invalid_commit_recovery(transition_id),
-                }
+                self.handle_transition_result(
+                    transition_id,
+                    self.dave.process_commit(&payload[5..]),
+                    "commit",
+                )?
             }
             VOICE_BINARY_OPCODE_WELCOME => {
                 if payload.len() < 5 {
@@ -483,22 +482,11 @@ where
                     ));
                 }
                 let transition_id = u16::from_be_bytes([payload[3], payload[4]]);
-                match self.dave.process_welcome(&payload[5..]) {
-                    Ok(_) => {
-                        if transition_id != 0 {
-                            self.state
-                                .pending_transitions
-                                .insert(transition_id, self.state.dave_protocol_version);
-                            Ok(vec![VoiceOutbound::Json(json!({
-                                "op": VoiceOpcode::DaveTransitionReady as u8,
-                                "d": { "transition_id": transition_id }
-                            }))])
-                        } else {
-                            Ok(Vec::new())
-                        }
-                    }
-                    Err(_) => self.invalid_commit_recovery(transition_id),
-                }
+                self.handle_transition_result(
+                    transition_id,
+                    self.dave.process_welcome(&payload[5..]),
+                    "welcome",
+                )?
             }
             _ => {
                 debug!(opcode, "ignoring unsupported voice binary opcode");
@@ -531,7 +519,7 @@ where
     }
 
     fn invalid_commit_recovery(&self, transition_id: u16) -> Result<Vec<VoiceOutbound>, VoiceError> {
-        self.ensure_dave_session(self.state.dave_protocol_version)?;
+        self.reinitialize_dave_session(self.state.dave_protocol_version)?;
         Ok(vec![
             VoiceOutbound::Json(json!({
                 "op": VoiceOpcode::MlsInvalidCommitWelcome as u8,
@@ -541,16 +529,51 @@ where
         ])
     }
 
-    fn ensure_dave_session(&self, protocol_version: u16) -> Result<(), VoiceError> {
-        if protocol_version == 0 {
-            return Ok(());
+    fn proposals_recovery(&self) -> Result<Vec<VoiceOutbound>, VoiceError> {
+        self.reinitialize_dave_session(self.state.dave_protocol_version)?;
+        Ok(vec![VoiceOutbound::Binary(self.key_package_message()?)])
+    }
+
+    fn handle_transition_result(
+        &mut self,
+        transition_id: u16,
+        result: Result<(), DaveError>,
+        recovery_label: &str,
+    ) -> Result<Vec<VoiceOutbound>, VoiceError> {
+        match result {
+            Ok(_) => self.transition_ready_outbound(transition_id),
+            Err(error) => {
+                debug!(
+                    error = %error,
+                    transition_id,
+                    recovery_label,
+                    "recovering from MLS {recovery_label} failure"
+                );
+                self.invalid_commit_recovery(transition_id)
+            }
+        }
+    }
+
+    fn transition_ready_outbound(
+        &mut self,
+        transition_id: u16,
+    ) -> Result<Vec<VoiceOutbound>, VoiceError> {
+        if transition_id == 0 {
+            return Ok(Vec::new());
         }
 
-        let state = self
-            .dave
-            .state()
-            .map_err(|error| VoiceError::Dave(error.to_string()))?;
-        if state.initialized && state.protocol_version == Some(protocol_version) {
+        self.state
+            .pending_transitions
+            .insert(transition_id, self.state.dave_protocol_version);
+
+        Ok(vec![VoiceOutbound::Json(json!({
+            "op": VoiceOpcode::DaveTransitionReady as u8,
+            "d": { "transition_id": transition_id }
+        }))])
+    }
+
+    fn reinitialize_dave_session(&self, protocol_version: u16) -> Result<(), VoiceError> {
+        if protocol_version == 0 {
             return Ok(());
         }
 
@@ -575,6 +598,22 @@ where
             })
             .map(|_| ())
             .map_err(|error| VoiceError::Dave(error.to_string()))
+    }
+
+    fn expected_user_ids(&self) -> Option<Vec<u64>> {
+        let mut user_ids: Vec<u64> = self.state.connected_users.iter().copied().collect();
+        if let Some(user_id) = self.session_user_id()
+            && !user_ids.contains(&user_id)
+        {
+            user_ids.push(user_id);
+        }
+        (!user_ids.is_empty()).then_some(user_ids)
+    }
+
+    fn session_user_id(&self) -> Option<u64> {
+        self.config
+            .as_ref()
+            .and_then(|config| config.user_id.parse::<u64>().ok())
     }
 }
 
@@ -669,6 +708,10 @@ impl VoiceSessionState {
                 }]
             }
         }))
+    }
+
+    pub fn set_streaming_announced(&mut self, announced: bool) {
+        self.streaming_announced = announced;
     }
 }
 
@@ -888,6 +931,21 @@ mod tests {
         })
         .expect("dave init");
         let mut controller = VoiceSessionController::new(dave);
+        controller.prepare_session(
+            VoiceServerInfo {
+                endpoint: "voice.example.test".to_owned(),
+                token: "voice-token".to_owned(),
+            },
+            VoiceSessionConfig {
+                server_id: "guild-1".to_owned(),
+                channel_id: "2".to_owned(),
+                user_id: "1".to_owned(),
+                session_id: "session-1".to_owned(),
+                token: "voice-token".to_owned(),
+                stream_kind: StreamKind::GoLive,
+                max_dave_protocol_version: 1,
+            },
+        );
         controller
             .handle_json_message(&json!({
                 "op": VoiceOpcode::Ready as u8,
@@ -928,7 +986,20 @@ mod tests {
 
     struct FakeDave;
 
+    struct FakeDaveWithProposalFailure;
+
     impl DaveSession for FakeDave {
+        fn protect(
+            &self,
+            _media_kind: dave::MediaKind,
+            _metadata: &DaveMetadata,
+            payload: Bytes,
+        ) -> Result<Bytes, DaveError> {
+            Ok(payload)
+        }
+    }
+
+    impl DaveSession for FakeDaveWithProposalFailure {
         fn protect(
             &self,
             _media_kind: dave::MediaKind,
@@ -959,6 +1030,7 @@ mod tests {
             &self,
             _operation: ProposalOp,
             _proposals: &[u8],
+            _recognized_user_ids: Option<&[u64]>,
         ) -> Result<DaveState, DaveError> {
             Ok(DaveState::default())
         }
@@ -967,6 +1039,7 @@ mod tests {
             &self,
             _operation: ProposalOp,
             _proposals: &[u8],
+            _recognized_user_ids: Option<&[u64]>,
         ) -> Result<DaveProposalResult, DaveError> {
             Ok(DaveProposalResult {
                 state: DaveState {
@@ -999,11 +1072,58 @@ mod tests {
         }
     }
 
+    impl DaveControl for FakeDaveWithProposalFailure {
+        fn initialize(&self, _config: DaveInitConfig) -> Result<DaveState, DaveError> {
+            Ok(DaveState::default())
+        }
+
+        fn set_external_sender(
+            &self,
+            _external_sender_data: &[u8],
+        ) -> Result<DaveState, DaveError> {
+            Ok(DaveState::default())
+        }
+
+        fn create_key_package(&self) -> Result<Vec<u8>, DaveError> {
+            Ok(vec![4, 5, 6])
+        }
+
+        fn process_proposals(
+            &self,
+            _operation: ProposalOp,
+            _proposals: &[u8],
+            _recognized_user_ids: Option<&[u64]>,
+        ) -> Result<DaveState, DaveError> {
+            Err(DaveError::Message("proposal failure".to_owned()))
+        }
+
+        fn process_proposals_bundle(
+            &self,
+            _operation: ProposalOp,
+            _proposals: &[u8],
+            _recognized_user_ids: Option<&[u64]>,
+        ) -> Result<DaveProposalResult, DaveError> {
+            Err(DaveError::Message("proposal failure".to_owned()))
+        }
+
+        fn process_welcome(&self, _welcome: &[u8]) -> Result<DaveState, DaveError> {
+            Ok(DaveState::default())
+        }
+
+        fn process_commit(&self, _commit: &[u8]) -> Result<DaveState, DaveError> {
+            Ok(DaveState::default())
+        }
+
+        fn state(&self) -> Result<DaveState, DaveError> {
+            Ok(DaveState::default())
+        }
+    }
+
     #[test]
     fn binary_proposals_emit_commit_welcome() {
         let mut controller = VoiceSessionController::new(FakeDave);
         let outbound = controller
-            .handle_binary_message(&[0, 1, VoiceBinaryOpcode::MlsProposals as u8, 1, 0xaa])
+            .handle_binary_message(&[0, 1, VoiceBinaryOpcode::MlsProposals as u8, 0, 0xaa])
             .expect("binary proposals");
         assert_eq!(outbound.len(), 1);
         match &outbound[0] {
@@ -1013,5 +1133,31 @@ mod tests {
             }
             other => panic!("unexpected outbound: {other:?}"),
         }
+    }
+
+    #[test]
+    fn binary_proposals_recover_with_fresh_key_package() {
+        let mut controller = VoiceSessionController::new(FakeDaveWithProposalFailure);
+        controller.prepare_session(
+            VoiceServerInfo {
+                endpoint: "voice.example.test".to_owned(),
+                token: "voice-token".to_owned(),
+            },
+            VoiceSessionConfig {
+                server_id: "guild-1".to_owned(),
+                channel_id: "2".to_owned(),
+                user_id: "1".to_owned(),
+                session_id: "session-1".to_owned(),
+                token: "voice-token".to_owned(),
+                stream_kind: StreamKind::GoLive,
+                max_dave_protocol_version: 1,
+            },
+        );
+        controller.state_mut().dave_protocol_version = 1;
+
+        let outbound = controller
+            .handle_binary_message(&[0, 1, VoiceBinaryOpcode::MlsProposals as u8, 0, 0xaa])
+            .expect("proposal recovery");
+        assert_eq!(outbound, vec![VoiceOutbound::Binary(vec![26, 4, 5, 6])]);
     }
 }

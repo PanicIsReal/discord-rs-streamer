@@ -69,6 +69,8 @@ where
             .video_command_payload(&video_config)
             .ok_or(VoiceMediaSessionError::NotReady)?;
         client.send_video_command(video_command).await?;
+        publisher.wait_until_ready(timeout).await?;
+        client.set_streaming_announced(true).await?;
 
         Ok(Self { client, publisher })
     }

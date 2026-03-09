@@ -1,5 +1,6 @@
 use std::ffi::CString;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use datachannel::{
     Codec, ConnectionState, DataChannelHandler, DataChannelInfo, Direction, IceCandidate,
@@ -10,6 +11,7 @@ use datachannel::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::Level;
+use tracing::warn;
 
 use crate::{AUDIO_MID, TrackPlan, TrackSpec, VIDEO_MID};
 
@@ -40,6 +42,8 @@ pub struct VoicePublisherState {
     pub remote_description: Option<String>,
     pub local_candidates: Vec<String>,
     pub connection_state: Option<String>,
+    pub audio_track_open: bool,
+    pub video_track_open: bool,
     pub audio_frames_sent: u64,
     pub video_frames_sent: u64,
     pub audio_bytes_sent: u64,
@@ -55,8 +59,12 @@ pub enum VoicePublisherError {
     Track(String, String),
     #[error("publisher lock poisoned")]
     LockPoisoned,
+    #[error("track `{0}` is not ready for media yet")]
+    TrackNotReady(String),
     #[error("remote sdp could not be parsed: {0}")]
     InvalidRemoteDescription(String),
+    #[error("publisher did not reach ready state before timeout")]
+    ReadyTimeout,
 }
 
 pub struct VoicePeerPublisher {
@@ -89,8 +97,8 @@ impl VoicePeerPublisher {
         };
         let mut peer_connection = RtcPeerConnection::new(&rtc_config, handler)
             .map_err(|error| VoicePublisherError::PeerConnection(error.to_string()))?;
-        let mut audio_track = add_track(&mut peer_connection, &track_plan.audio)?;
-        let mut video_track = add_track(&mut peer_connection, &track_plan.video)?;
+        let mut audio_track = add_track(&mut peer_connection, &track_plan.audio, &state)?;
+        let mut video_track = add_track(&mut peer_connection, &track_plan.video, &state)?;
         configure_audio_packetizer(&mut audio_track, &track_plan.audio, &config)?;
         configure_video_packetizer(&mut video_track, &track_plan.video, &config)?;
 
@@ -143,22 +151,22 @@ impl VoicePeerPublisher {
     }
 
     pub fn send_audio(&mut self, payload: &[u8]) -> Result<(), VoicePublisherError> {
-        self.audio_track
-            .send(payload)
-            .map_err(|error| self.track_error("audio", error))?;
-        advance_track_timestamp(&mut self.audio_track, self.audio_timestamp_step)
-            .map_err(|error| self.track_error("audio", error))?;
-        self.record_send(PublisherTrackKind::Audio, payload.len())?;
+        self.send_track(
+            &mut self.audio_track,
+            payload,
+            self.audio_timestamp_step,
+            PublisherTrackKind::Audio,
+        )?;
         Ok(())
     }
 
     pub fn send_video(&mut self, payload: &[u8]) -> Result<(), VoicePublisherError> {
-        self.video_track
-            .send(payload)
-            .map_err(|error| self.track_error("video", error))?;
-        advance_track_timestamp(&mut self.video_track, self.video_timestamp_step)
-            .map_err(|error| self.track_error("video", error))?;
-        self.record_send(PublisherTrackKind::Video, payload.len())?;
+        self.send_track(
+            &mut self.video_track,
+            payload,
+            self.video_timestamp_step,
+            PublisherTrackKind::Video,
+        )?;
         Ok(())
     }
 
@@ -167,6 +175,46 @@ impl VoicePeerPublisher {
             .lock()
             .map(|state| state.clone())
             .map_err(|_| VoicePublisherError::LockPoisoned)
+    }
+
+    pub async fn wait_until_ready(&self, timeout: Duration) -> Result<(), VoicePublisherError> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if self.is_ready()? {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(VoicePublisherError::ReadyTimeout);
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    fn is_ready(&self) -> Result<bool, VoicePublisherError> {
+        self.state
+            .lock()
+            .map(|state| publisher_ready(&state))
+            .map_err(|_| VoicePublisherError::LockPoisoned)
+    }
+
+    fn send_track(
+        &self,
+        track: &mut RtcTrack<PublisherTrackHandler>,
+        payload: &[u8],
+        timestamp_step: u32,
+        kind: PublisherTrackKind,
+    ) -> Result<(), VoicePublisherError> {
+        if !self.is_ready()? {
+            return Err(VoicePublisherError::TrackNotReady(track_label(kind).to_owned()));
+        }
+
+        track
+            .send(payload)
+            .map_err(|error| self.track_error(track_label(kind), error))?;
+        advance_track_timestamp(track, timestamp_step)
+            .map_err(|error| self.track_error(track_label(kind), error))?;
+        self.record_send(kind, payload.len())?;
+        Ok(())
     }
 
     fn record_send(
@@ -221,6 +269,7 @@ fn build_rtc_config(config: &VoicePublisherConfig) -> RtcConfig {
 fn add_track(
     peer_connection: &mut Box<RtcPeerConnection<PublisherPeerConnectionHandler>>,
     track: &TrackSpec,
+    state: &Arc<Mutex<VoicePublisherState>>,
 ) -> Result<Box<RtcTrack<PublisherTrackHandler>>, VoicePublisherError> {
     peer_connection
         .add_track_ex(
@@ -235,9 +284,16 @@ fn add_track(
                 name: None,
                 msid: None,
                 track_id: None,
-                profile: None,
+                profile: track_profile(track)?,
             },
-            PublisherTrackHandler,
+            PublisherTrackHandler {
+                state: Arc::clone(state),
+                kind: if track.mid == AUDIO_MID {
+                    PublisherTrackKind::Audio
+                } else {
+                    PublisherTrackKind::Video
+                },
+            },
         )
         .map_err(|error| VoicePublisherError::Track(track.mid.clone(), error.to_string()))
 }
@@ -254,33 +310,48 @@ fn codec_for(track: &TrackSpec) -> Codec {
     }
 }
 
-fn configure_audio_packetizer(
-    track: &mut RtcTrack<PublisherTrackHandler>,
-    spec: &TrackSpec,
-    config: &VoicePublisherConfig,
-) -> Result<(), VoicePublisherError> {
-    let init = PacketizerInit {
+fn track_profile(track: &TrackSpec) -> Result<Option<CString>, VoicePublisherError> {
+    if matches!(codec_for(track), Codec::H264) {
+        return CString::new(
+            "profile-level-id=42e01f;packetization-mode=1;level-asymmetry-allowed=1",
+        )
+        .map(Some)
+        .map_err(|error| VoicePublisherError::Track(track.mid.clone(), error.to_string()));
+    }
+
+    Ok(None)
+}
+
+fn packetizer_init(spec: &TrackSpec) -> PacketizerInit {
+    PacketizerInit {
         ssrc: spec.ssrc,
         cname: spec.mid.clone(),
         payload_type: spec.payload_type,
         clock_rate: clock_rate_for(spec),
         sequence_number: initial_sequence_number(spec),
         timestamp: initial_timestamp(spec),
-        max_fragment_size: 0,
+        max_fragment_size: 1200,
         nal_separator: NalUnitSeparator::StartSequence,
-        playout_delay_id: 5,
+        playout_delay_id: 0,
         playout_delay_min: 0,
-        playout_delay_max: config.audio_frame_duration_ms as u16,
-    };
+        playout_delay_max: 0,
+    }
+}
+
+fn configure_audio_packetizer(
+    track: &mut RtcTrack<PublisherTrackHandler>,
+    spec: &TrackSpec,
+    _config: &VoicePublisherConfig,
+) -> Result<(), VoicePublisherError> {
+    let init = packetizer_init(spec);
     track
         .set_opus_packetizer(&init)
         .map_err(|error| VoicePublisherError::Track(spec.mid.clone(), error.to_string()))?;
-    track
-        .chain_rtcp_sr_reporter()
-        .map_err(|error| VoicePublisherError::Track(spec.mid.clone(), error.to_string()))?;
-    track
-        .chain_rtcp_nack_responder(512)
-        .map_err(|error| VoicePublisherError::Track(spec.mid.clone(), error.to_string()))
+    try_chain_track("audio", "rtcp sr reporter", || track.chain_rtcp_sr_reporter());
+    try_chain_track("audio", "rtcp nack responder", || {
+        track.chain_rtcp_nack_responder(512)
+    });
+    Ok(())
 }
 
 fn configure_video_packetizer(
@@ -288,28 +359,16 @@ fn configure_video_packetizer(
     spec: &TrackSpec,
     config: &VoicePublisherConfig,
 ) -> Result<(), VoicePublisherError> {
-    let init = PacketizerInit {
-        ssrc: spec.ssrc,
-        cname: spec.mid.clone(),
-        payload_type: spec.payload_type,
-        clock_rate: clock_rate_for(spec),
-        sequence_number: initial_sequence_number(spec),
-        timestamp: initial_timestamp(spec),
-        max_fragment_size: 0,
-        nal_separator: NalUnitSeparator::StartSequence,
-        playout_delay_id: 5,
-        playout_delay_min: 0,
-        playout_delay_max: video_frame_delay_ms(config) as u16,
-    };
+    let init = packetizer_init(spec);
     track
         .set_h264_packetizer(&init)
         .map_err(|error| VoicePublisherError::Track(spec.mid.clone(), error.to_string()))?;
-    track
-        .chain_rtcp_sr_reporter()
-        .map_err(|error| VoicePublisherError::Track(spec.mid.clone(), error.to_string()))?;
-    track
-        .chain_rtcp_nack_responder(1024)
-        .map_err(|error| VoicePublisherError::Track(spec.mid.clone(), error.to_string()))
+    try_chain_track("video", "rtcp sr reporter", || track.chain_rtcp_sr_reporter());
+    try_chain_track("video", "rtcp nack responder", || {
+        track.chain_rtcp_nack_responder(1024)
+    });
+    let _ = config;
+    Ok(())
 }
 
 fn advance_track_timestamp(
@@ -328,8 +387,14 @@ fn video_timestamp_step(spec: &TrackSpec, config: &VoicePublisherConfig) -> u32 
     clock_rate_for(spec) / config.video_framerate.max(1)
 }
 
-fn video_frame_delay_ms(config: &VoicePublisherConfig) -> u32 {
-    1_000 / config.video_framerate.max(1)
+fn try_chain_track(
+    kind: &str,
+    chain_name: &str,
+    action: impl FnOnce() -> datachannel::Result<()>,
+) {
+    if let Err(error) = action() {
+        warn!(track = kind, chain = chain_name, %error, "publisher track chaining failed");
+    }
 }
 
 fn clock_rate_for(spec: &TrackSpec) -> u32 {
@@ -337,6 +402,12 @@ fn clock_rate_for(spec: &TrackSpec) -> u32 {
         crate::TrackKind::Audio => 48_000,
         crate::TrackKind::Video => 90_000,
     }
+}
+
+fn publisher_ready(state: &VoicePublisherState) -> bool {
+    state.connection_state.as_deref() == Some("Connected")
+        && state.audio_track_open
+        && state.video_track_open
 }
 
 fn initial_sequence_number(spec: &TrackSpec) -> u16 {
@@ -531,10 +602,42 @@ fn fallback_fingerprint(fingerprint: &str) -> String {
     }
 }
 
-#[derive(Default)]
-struct PublisherTrackHandler;
+struct PublisherTrackHandler {
+    state: Arc<Mutex<VoicePublisherState>>,
+    kind: PublisherTrackKind,
+}
 
-impl TrackHandler for PublisherTrackHandler {}
+impl TrackHandler for PublisherTrackHandler {
+    fn set_open_state(&self, open: bool) {
+        if let Ok(mut state) = self.state.lock() {
+            match self.kind {
+                PublisherTrackKind::Audio => state.audio_track_open = open,
+                PublisherTrackKind::Video => state.video_track_open = open,
+            }
+        }
+    }
+
+    fn on_open(&mut self) {
+        self.set_open_state(true);
+    }
+
+    fn on_closed(&mut self) {
+        self.set_open_state(false);
+    }
+
+    fn on_error(&mut self, err: &str) {
+        if let Ok(mut state) = self.state.lock() {
+            state.last_send_error = Some(format!("{}: {err}", track_label(self.kind)));
+        }
+    }
+}
+
+fn track_label(kind: PublisherTrackKind) -> &'static str {
+    match kind {
+        PublisherTrackKind::Audio => "audio",
+        PublisherTrackKind::Video => "video",
+    }
+}
 
 #[derive(Default)]
 struct PublisherDataChannelHandler;
@@ -567,6 +670,13 @@ impl PeerConnectionHandler for PublisherPeerConnectionHandler {
     fn on_connection_state_change(&mut self, state: ConnectionState) {
         if let Ok(mut publisher_state) = self.state.lock() {
             publisher_state.connection_state = Some(format!("{state:?}"));
+            if matches!(
+                state,
+                ConnectionState::Closed | ConnectionState::Disconnected | ConnectionState::Failed
+            ) {
+                publisher_state.audio_track_open = false;
+                publisher_state.video_track_open = false;
+            }
         }
     }
 
@@ -576,4 +686,29 @@ impl PeerConnectionHandler for PublisherPeerConnectionHandler {
 #[allow(dead_code)]
 fn _assert_result_type<T>(value: DcResult<T>) -> DcResult<T> {
     value
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{VoicePublisherState, publisher_ready};
+
+    #[test]
+    fn publisher_ready_requires_connected_and_open_tracks() {
+        let base = VoicePublisherState::default();
+        assert!(!publisher_ready(&base));
+
+        let connected = VoicePublisherState {
+            connection_state: Some("Connected".to_owned()),
+            audio_track_open: true,
+            video_track_open: true,
+            ..VoicePublisherState::default()
+        };
+        assert!(publisher_ready(&connected));
+
+        let missing_video = VoicePublisherState {
+            video_track_open: false,
+            ..connected.clone()
+        };
+        assert!(!publisher_ready(&missing_video));
+    }
 }

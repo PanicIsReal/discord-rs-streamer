@@ -221,6 +221,18 @@ where
         self.send_json(payload).await
     }
 
+    pub async fn set_streaming_announced(
+        &self,
+        announced: bool,
+    ) -> Result<(), VoiceGatewayError> {
+        self.controller
+            .lock()
+            .await
+            .state_mut()
+            .set_streaming_announced(announced);
+        Ok(())
+    }
+
     pub async fn close(mut self) -> Result<(), VoiceGatewayError> {
         let _ = self.command_tx.send(ClientCommand::Close);
         if let Some(task) = self.task.take() {

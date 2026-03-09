@@ -126,6 +126,14 @@ enum IngestSubcommand {
         #[arg(long, default_value_t = 0)]
         interval_ms: u64,
     },
+    SendH264AnnexB {
+        #[arg(long)]
+        socket: String,
+        #[arg(long)]
+        input: Option<PathBuf>,
+        #[arg(long, default_value_t = 65536)]
+        read_chunk_size: usize,
+    },
     SendOggOpus {
         #[arg(long)]
         socket: String,
@@ -267,6 +275,13 @@ async fn main() -> anyhow::Result<()> {
             } => {
                 send_framed(socket, input, repeat, interval_ms).await?;
             }
+            IngestSubcommand::SendH264AnnexB {
+                socket,
+                input,
+                read_chunk_size,
+            } => {
+                send_h264_annex_b(socket, input, read_chunk_size).await?;
+            }
             IngestSubcommand::SendOggOpus {
                 socket,
                 input,
@@ -385,6 +400,40 @@ async fn send_ogg_opus(socket: String, input: PathBuf, interval_ms: u64) -> anyh
     Ok(())
 }
 
+async fn send_h264_annex_b(
+    socket: String,
+    input: Option<PathBuf>,
+    read_chunk_size: usize,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(read_chunk_size > 0, "read_chunk_size must be positive");
+    let mut stream = UnixStream::connect(socket).await?;
+    let mut reader: Box<dyn tokio::io::AsyncRead + Unpin + Send> = match input {
+        Some(path) => Box::new(tokio::fs::File::open(path).await?),
+        None => Box::new(io::stdin()),
+    };
+
+    let mut read_buf = vec![0_u8; read_chunk_size];
+    let mut parser = AnnexBAccessUnitParser::default();
+
+    loop {
+        let bytes_read = reader.read(&mut read_buf).await?;
+        if bytes_read == 0 {
+            break;
+        }
+
+        let access_units = parser.push(&read_buf[..bytes_read]);
+        for access_unit in access_units {
+            write_framed_packet(&mut stream, &access_unit).await?;
+        }
+    }
+
+    if let Some(access_unit) = parser.finish() {
+        write_framed_packet(&mut stream, &access_unit).await?;
+    }
+
+    Ok(())
+}
+
 async fn write_framed_packet(stream: &mut UnixStream, payload: &[u8]) -> anyhow::Result<()> {
     stream
         .write_all(&(payload.len() as u32).to_be_bytes())
@@ -418,5 +467,120 @@ fn map_ingest_protocol(value: IngestProtocolArg) -> IngestProtocol {
     match value {
         IngestProtocolArg::Raw => IngestProtocol::Raw,
         IngestProtocolArg::Framed => IngestProtocol::Framed,
+    }
+}
+
+#[derive(Default)]
+struct AnnexBAccessUnitParser {
+    buffer: Vec<u8>,
+    frame_start: Option<usize>,
+    scan_offset: usize,
+}
+
+impl AnnexBAccessUnitParser {
+    fn push(&mut self, bytes: &[u8]) -> Vec<Vec<u8>> {
+        self.buffer.extend_from_slice(bytes);
+        self.drain_complete_access_units(false)
+    }
+
+    fn finish(&mut self) -> Option<Vec<u8>> {
+        let mut frames = self.drain_complete_access_units(true);
+        frames.pop()
+    }
+
+    fn drain_complete_access_units(&mut self, flush: bool) -> Vec<Vec<u8>> {
+        let mut frames = Vec::new();
+
+        while let Some((start, start_code_len, nal_header)) =
+            find_annex_b_start_code(&self.buffer, self.scan_offset)
+        {
+            let nal_type = nal_header & 0x1f;
+            if nal_type == 9 {
+                if let Some(frame_start) = self.frame_start
+                    && start > frame_start
+                {
+                    frames.push(self.buffer[frame_start..start].to_vec());
+                }
+                self.frame_start = Some(start);
+            } else if self.frame_start.is_none() {
+                self.frame_start = Some(start);
+            }
+
+            self.scan_offset = start + start_code_len + 1;
+        }
+
+        if let Some(frame_start) = self.frame_start {
+            if frame_start > 0 {
+                self.buffer.drain(..frame_start);
+                self.scan_offset = self.scan_offset.saturating_sub(frame_start);
+                self.frame_start = Some(0);
+            }
+        } else if self.buffer.len() > 4 {
+            let keep_from = self.buffer.len() - 4;
+            self.buffer.drain(..keep_from);
+            self.scan_offset = self.scan_offset.saturating_sub(keep_from);
+        }
+
+        if flush {
+            if let Some(frame_start) = self.frame_start.take()
+                && self.buffer.len() > frame_start
+            {
+                frames.push(self.buffer[frame_start..].to_vec());
+            }
+            self.buffer.clear();
+            self.scan_offset = 0;
+        }
+
+        frames
+    }
+}
+
+fn find_annex_b_start_code(
+    bytes: &[u8],
+    start_at: usize,
+) -> Option<(usize, usize, u8)> {
+    if bytes.len() < 4 {
+        return None;
+    }
+
+    let mut index = start_at.min(bytes.len().saturating_sub(4));
+    while index + 3 < bytes.len() {
+        let (start_code_len, nal_header_index) = if bytes[index..].starts_with(&[0, 0, 1]) {
+            (3, index + 3)
+        } else if bytes[index..].starts_with(&[0, 0, 0, 1]) {
+            (4, index + 4)
+        } else {
+            index += 1;
+            continue;
+        };
+
+        if nal_header_index < bytes.len() {
+            return Some((index, start_code_len, bytes[nal_header_index]));
+        }
+
+        return None;
+    }
+
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AnnexBAccessUnitParser;
+
+    #[test]
+    fn annex_b_parser_splits_on_aud_boundaries() {
+        let mut parser = AnnexBAccessUnitParser::default();
+        let stream = [
+            0, 0, 0, 1, 0x09, 0xf0, 0, 0, 0, 1, 0x67, 0x64, 0, 0, 0, 1, 0x65, 0x88, 0x84, 0,
+            0, 0, 1, 0x09, 0xf0, 0, 0, 0, 1, 0x61, 0x9a,
+        ];
+
+        let frames = parser.push(&stream);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0], stream[..19].to_vec());
+
+        let final_frame = parser.finish().expect("last frame");
+        assert_eq!(final_frame, stream[19..].to_vec());
     }
 }

@@ -128,11 +128,13 @@ pub trait DaveControl: DaveSession + Send + Sync {
         &self,
         operation: ProposalOp,
         proposals: &[u8],
+        expected_user_ids: Option<&[u64]>,
     ) -> Result<DaveState, DaveError>;
     fn process_proposals_bundle(
         &self,
         operation: ProposalOp,
         proposals: &[u8],
+        expected_user_ids: Option<&[u64]>,
     ) -> Result<DaveProposalResult, DaveError>;
     fn process_welcome(&self, welcome: &[u8]) -> Result<DaveState, DaveError>;
     fn process_commit(&self, commit: &[u8]) -> Result<DaveState, DaveError>;
@@ -173,16 +175,18 @@ where
         &self,
         operation: ProposalOp,
         proposals: &[u8],
+        expected_user_ids: Option<&[u64]>,
     ) -> Result<DaveState, DaveError> {
-        (**self).process_proposals(operation, proposals)
+        (**self).process_proposals(operation, proposals, expected_user_ids)
     }
 
     fn process_proposals_bundle(
         &self,
         operation: ProposalOp,
         proposals: &[u8],
+        expected_user_ids: Option<&[u64]>,
     ) -> Result<DaveProposalResult, DaveError> {
-        (**self).process_proposals_bundle(operation, proposals)
+        (**self).process_proposals_bundle(operation, proposals, expected_user_ids)
     }
 
     fn process_welcome(&self, welcome: &[u8]) -> Result<DaveState, DaveError> {
@@ -261,18 +265,27 @@ impl DaveControl for ManagedDaveSession {
             (Some(private), Some(public)) => Some(SigningKeyPair { private, public }),
             _ => return Err(DaveError::IncompleteKeyPair),
         };
-
-        let session = VendorDaveSession::new(
-            protocol_version,
-            config.user_id,
-            config.channel_id,
-            key_pair.as_ref(),
-        )
-        .map_err(map_dave_message)?;
-
         {
             let mut guard = self.lock().map_err(map_dave_message)?;
-            *guard = Some(session);
+            if let Some(session) = guard.as_mut() {
+                session
+                    .reinit(
+                        protocol_version,
+                        config.user_id,
+                        config.channel_id,
+                        key_pair.as_ref(),
+                    )
+                    .map_err(map_dave_message)?;
+            } else {
+                let session = VendorDaveSession::new(
+                    protocol_version,
+                    config.user_id,
+                    config.channel_id,
+                    key_pair.as_ref(),
+                )
+                .map_err(map_dave_message)?;
+                *guard = Some(session);
+            }
         }
         self.state()
     }
@@ -294,8 +307,9 @@ impl DaveControl for ManagedDaveSession {
         &self,
         operation: ProposalOp,
         proposals: &[u8],
+        expected_user_ids: Option<&[u64]>,
     ) -> Result<DaveState, DaveError> {
-        self.process_proposals_bundle(operation, proposals)
+        self.process_proposals_bundle(operation, proposals, expected_user_ids)
             .map(|result| result.state)
     }
 
@@ -303,11 +317,12 @@ impl DaveControl for ManagedDaveSession {
         &self,
         operation: ProposalOp,
         proposals: &[u8],
+        expected_user_ids: Option<&[u64]>,
     ) -> Result<DaveProposalResult, DaveError> {
         let operation = proposal_operation(operation);
         let commit_welcome = self.with_session(|session| {
             session
-                .process_proposals(operation, proposals, None)
+                .process_proposals(operation, proposals, expected_user_ids)
                 .map_err(map_dave_message)
                 .map(|bundle| {
                     bundle.map(|bundle| DaveCommitWelcome {
@@ -407,7 +422,7 @@ mod tests {
             .expect("init");
 
         let result = session
-            .process_proposals_bundle(ProposalOp::Append, &[0])
+            .process_proposals_bundle(ProposalOp::Append, &[0], None)
             .expect_err("invalid proposals should fail before creating a bundle");
         assert!(matches!(result, DaveError::Message(_)));
     }

@@ -125,6 +125,7 @@ impl DaveControl for PassthroughDaveSession {
         &self,
         _operation: ProposalOp,
         _proposals: &[u8],
+        _expected_user_ids: Option<&[u64]>,
     ) -> Result<DaveState, DaveError> {
         self.state()
     }
@@ -133,6 +134,7 @@ impl DaveControl for PassthroughDaveSession {
         &self,
         _operation: ProposalOp,
         _proposals: &[u8],
+        _expected_user_ids: Option<&[u64]>,
     ) -> Result<DaveProposalResult, DaveError> {
         Ok(DaveProposalResult {
             state: self.state()?,

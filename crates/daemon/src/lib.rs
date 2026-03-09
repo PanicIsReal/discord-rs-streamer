@@ -722,7 +722,7 @@ impl DaemonController {
     ) -> Result<DaveProposalsResponse, ApiError> {
         let proposals = decode_binary(request.data)?;
         self.dave
-            .process_proposals_bundle(request.operation, &proposals)
+            .process_proposals_bundle(request.operation, &proposals, None)
             .map(DaveProposalsResponse::from)
             .map_err(|error| ApiError::BadRequest(error.to_string()))
     }
@@ -863,10 +863,16 @@ async fn forward_chunk(
     protected_payload: &[u8],
 ) -> Result<(), String> {
     if let Some(active) = active_media.lock().await.as_mut() {
-        active
+        match active
             .session
             .send_media(to_voice_media_kind(kind), protected_payload)
-            .map_err(|error| error.to_string())?;
+        {
+            Ok(()) => {}
+            Err(discord_voice::session::VoiceMediaSessionError::Publisher(
+                discord_voice::publisher::VoicePublisherError::TrackNotReady(_),
+            )) => {}
+            Err(error) => return Err(error.to_string()),
+        }
         return Ok(());
     }
 
