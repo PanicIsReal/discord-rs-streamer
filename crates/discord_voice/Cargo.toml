@@ -1,0 +1,25 @@
+[package]
+name = "discord_voice"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+webrtc = ["dep:datachannel"]
+
+[dependencies]
+bytes.workspace = true
+dave = { path = "../dave" }
+futures-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+tracing.workspace = true
+url.workspace = true
+uuid.workspace = true
+datachannel = { version = "0.16.0", default-features = false, features = ["vendored", "media", "tracing"], optional = true }
