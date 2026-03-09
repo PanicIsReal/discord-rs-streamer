@@ -130,18 +130,16 @@ pub fn spawn_stdin_ingest(
     config: StdinSourceConfig,
     sender: mpsc::Sender<IngestChunk>,
 ) -> JoinHandle<Result<(), IngestError>> {
-    tokio::spawn(
-        async move {
-            read_reader(
-                config.kind,
-                stdin(),
-                sender,
-                config.read_chunk_size,
-                config.protocol,
-            )
-            .await
-        },
-    )
+    tokio::spawn(async move {
+        read_reader(
+            config.kind,
+            stdin(),
+            sender,
+            config.read_chunk_size,
+            config.protocol,
+        )
+        .await
+    })
 }
 
 async fn run_listener(
@@ -154,9 +152,7 @@ async fn run_listener(
     while let Ok((stream, _)) = listener.accept().await {
         let sender = sender.clone();
         tokio::spawn(async move {
-            if let Err(error) =
-                read_reader(kind, stream, sender, read_chunk_size, protocol).await
-            {
+            if let Err(error) = read_reader(kind, stream, sender, read_chunk_size, protocol).await {
                 warn!(?error, ?kind, "ingest reader exited");
             }
         });

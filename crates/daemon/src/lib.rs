@@ -759,7 +759,12 @@ impl DaemonController {
         let publisher = {
             let active_media = self.active_media.lock().await;
             if let Some(active) = active_media.as_ref() {
-                active.session.health().await.ok().map(|health| health.publisher)
+                active
+                    .session
+                    .health()
+                    .await
+                    .ok()
+                    .map(|health| health.publisher)
             } else {
                 None
             }
@@ -810,16 +815,15 @@ async fn forward_ingest(
             let kind = to_dave_media_kind(chunk.kind);
             let dave_state = dave.state().map_err(|error| error.to_string())?;
             let protected = if dave_state.ready {
-                dave
-                    .protect(
-                        kind,
-                        &DaveMetadata {
-                            sequence,
-                            timestamp_ms: sequence,
-                        },
-                        chunk.payload,
-                    )
-                    .map_err(|error| error.to_string())?
+                dave.protect(
+                    kind,
+                    &DaveMetadata {
+                        sequence,
+                        timestamp_ms: sequence,
+                    },
+                    chunk.payload,
+                )
+                .map_err(|error| error.to_string())?
             } else {
                 chunk.payload
             };
@@ -1129,11 +1133,13 @@ async fn build_ingest_source(
     tx: mpsc::Sender<IngestChunk>,
     read_chunk_size: usize,
 ) -> Result<(Option<UnixSocketIngestServer>, Option<IngestTaskHandle>), ApiError> {
-    let ingest_protocol = request.ingest_protocol.unwrap_or(if cfg!(feature = "webrtc-media") {
-        IngestProtocol::Framed
-    } else {
-        IngestProtocol::Raw
-    });
+    let ingest_protocol = request
+        .ingest_protocol
+        .unwrap_or(if cfg!(feature = "webrtc-media") {
+            IngestProtocol::Framed
+        } else {
+            IngestProtocol::Raw
+        });
     match &request.source {
         IngestSource::Unix => {
             let video_socket = request.video_socket.clone().ok_or_else(|| {

@@ -221,10 +221,7 @@ where
         self.send_json(payload).await
     }
 
-    pub async fn set_streaming_announced(
-        &self,
-        announced: bool,
-    ) -> Result<(), VoiceGatewayError> {
+    pub async fn set_streaming_announced(&self, announced: bool) -> Result<(), VoiceGatewayError> {
         self.controller
             .lock()
             .await
@@ -326,7 +323,13 @@ where
         }
         Message::Close(frame) => {
             let detail = frame
-                .map(|frame| format!("voice gateway closed: {} {}", u16::from(frame.code), frame.reason))
+                .map(|frame| {
+                    format!(
+                        "voice gateway closed: {} {}",
+                        u16::from(frame.code),
+                        frame.reason
+                    )
+                })
                 .unwrap_or_else(|| "voice gateway closed".to_owned());
             return Err(detail);
         }

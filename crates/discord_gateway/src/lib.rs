@@ -799,11 +799,9 @@ fn has_stream_session_resources(state: &GatewayState) -> bool {
 }
 
 fn build_media_session(state: &GatewayState) -> Result<GatewayMediaSession, GatewayError> {
-    let session = state
-        .health
-        .session
-        .clone()
-        .ok_or_else(|| GatewayError::Message("discord media session is missing login session".to_owned()))?;
+    let session = state.health.session.clone().ok_or_else(|| {
+        GatewayError::Message("discord media session is missing login session".to_owned())
+    })?;
     if !state.health.streaming {
         return Err(GatewayError::Message(
             "discord media session requires an active stream session".to_owned(),
@@ -811,41 +809,33 @@ fn build_media_session(state: &GatewayState) -> Result<GatewayMediaSession, Gate
     }
 
     Ok(GatewayMediaSession {
-        user_id: state
-            .self_user_id
-            .clone()
-            .ok_or_else(|| GatewayError::Message("discord media session is missing self user id".to_owned()))?,
+        user_id: state.self_user_id.clone().ok_or_else(|| {
+            GatewayError::Message("discord media session is missing self user id".to_owned())
+        })?,
         guild_id: session_guild_id(&session).map(ToOwned::to_owned),
         channel_id: session.channel_id,
         stream_kind: session.stream_kind,
-        voice_session_id: state
-            .voice_session_id
-            .clone()
-            .ok_or_else(|| GatewayError::Message("discord media session is missing voice session id".to_owned()))?,
-        voice_endpoint: state
-            .voice_endpoint
-            .clone()
-            .ok_or_else(|| GatewayError::Message("discord media session is missing voice endpoint".to_owned()))?,
-        voice_token: state
-            .voice_token
-            .clone()
-            .ok_or_else(|| GatewayError::Message("discord media session is missing voice token".to_owned()))?,
-        stream_key: state
-            .stream_key
-            .clone()
-            .ok_or_else(|| GatewayError::Message("discord media session is missing stream key".to_owned()))?,
-        stream_server_id: state
-            .stream_server_id
-            .clone()
-            .ok_or_else(|| GatewayError::Message("discord media session is missing stream server id".to_owned()))?,
-        stream_endpoint: state
-            .stream_endpoint
-            .clone()
-            .ok_or_else(|| GatewayError::Message("discord media session is missing stream endpoint".to_owned()))?,
-        stream_token: state
-            .stream_token
-            .clone()
-            .ok_or_else(|| GatewayError::Message("discord media session is missing stream token".to_owned()))?,
+        voice_session_id: state.voice_session_id.clone().ok_or_else(|| {
+            GatewayError::Message("discord media session is missing voice session id".to_owned())
+        })?,
+        voice_endpoint: state.voice_endpoint.clone().ok_or_else(|| {
+            GatewayError::Message("discord media session is missing voice endpoint".to_owned())
+        })?,
+        voice_token: state.voice_token.clone().ok_or_else(|| {
+            GatewayError::Message("discord media session is missing voice token".to_owned())
+        })?,
+        stream_key: state.stream_key.clone().ok_or_else(|| {
+            GatewayError::Message("discord media session is missing stream key".to_owned())
+        })?,
+        stream_server_id: state.stream_server_id.clone().ok_or_else(|| {
+            GatewayError::Message("discord media session is missing stream server id".to_owned())
+        })?,
+        stream_endpoint: state.stream_endpoint.clone().ok_or_else(|| {
+            GatewayError::Message("discord media session is missing stream endpoint".to_owned())
+        })?,
+        stream_token: state.stream_token.clone().ok_or_else(|| {
+            GatewayError::Message("discord media session is missing stream token".to_owned())
+        })?,
     })
 }
 

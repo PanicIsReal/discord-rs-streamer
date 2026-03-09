@@ -151,21 +151,23 @@ impl VoicePeerPublisher {
     }
 
     pub fn send_audio(&mut self, payload: &[u8]) -> Result<(), VoicePublisherError> {
-        self.send_track(
+        send_track(
             &mut self.audio_track,
             payload,
             self.audio_timestamp_step,
             PublisherTrackKind::Audio,
+            &self.state,
         )?;
         Ok(())
     }
 
     pub fn send_video(&mut self, payload: &[u8]) -> Result<(), VoicePublisherError> {
-        self.send_track(
+        send_track(
             &mut self.video_track,
             payload,
             self.video_timestamp_step,
             PublisherTrackKind::Video,
+            &self.state,
         )?;
         Ok(())
     }
@@ -191,68 +193,70 @@ impl VoicePeerPublisher {
     }
 
     fn is_ready(&self) -> Result<bool, VoicePublisherError> {
-        self.state
-            .lock()
-            .map(|state| publisher_ready(&state))
-            .map_err(|_| VoicePublisherError::LockPoisoned)
+        is_track_ready(&self.state)
+    }
+}
+
+fn is_track_ready(state: &Arc<Mutex<VoicePublisherState>>) -> Result<bool, VoicePublisherError> {
+    state
+        .lock()
+        .map(|state| publisher_ready(&state))
+        .map_err(|_| VoicePublisherError::LockPoisoned)
+}
+
+fn send_track(
+    track: &mut RtcTrack<PublisherTrackHandler>,
+    payload: &[u8],
+    timestamp_step: u32,
+    kind: PublisherTrackKind,
+    state: &Arc<Mutex<VoicePublisherState>>,
+) -> Result<(), VoicePublisherError> {
+    if !is_track_ready(state)? {
+        return Err(VoicePublisherError::TrackNotReady(
+            track_label(kind).to_owned(),
+        ));
     }
 
-    fn send_track(
-        &self,
-        track: &mut RtcTrack<PublisherTrackHandler>,
-        payload: &[u8],
-        timestamp_step: u32,
-        kind: PublisherTrackKind,
-    ) -> Result<(), VoicePublisherError> {
-        if !self.is_ready()? {
-            return Err(VoicePublisherError::TrackNotReady(track_label(kind).to_owned()));
+    track
+        .send(payload)
+        .map_err(|error| track_error(state, track_label(kind), error))?;
+    advance_track_timestamp(track, timestamp_step)
+        .map_err(|error| track_error(state, track_label(kind), error))?;
+    record_send(kind, payload.len(), state)
+}
+
+fn record_send(
+    kind: PublisherTrackKind,
+    bytes: usize,
+    state: &Arc<Mutex<VoicePublisherState>>,
+) -> Result<(), VoicePublisherError> {
+    let mut state = state
+        .lock()
+        .map_err(|_| VoicePublisherError::LockPoisoned)?;
+    match kind {
+        PublisherTrackKind::Audio => {
+            state.audio_frames_sent = state.audio_frames_sent.saturating_add(1);
+            state.audio_bytes_sent = state.audio_bytes_sent.saturating_add(bytes as u64);
         }
-
-        track
-            .send(payload)
-            .map_err(|error| self.track_error(track_label(kind), error))?;
-        advance_track_timestamp(track, timestamp_step)
-            .map_err(|error| self.track_error(track_label(kind), error))?;
-        self.record_send(kind, payload.len())?;
-        Ok(())
-    }
-
-    fn record_send(
-        &self,
-        kind: PublisherTrackKind,
-        bytes: usize,
-    ) -> Result<(), VoicePublisherError> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| VoicePublisherError::LockPoisoned)?;
-        match kind {
-            PublisherTrackKind::Audio => {
-                state.audio_frames_sent = state.audio_frames_sent.saturating_add(1);
-                state.audio_bytes_sent =
-                    state.audio_bytes_sent.saturating_add(bytes as u64);
-            }
-            PublisherTrackKind::Video => {
-                state.video_frames_sent = state.video_frames_sent.saturating_add(1);
-                state.video_bytes_sent =
-                    state.video_bytes_sent.saturating_add(bytes as u64);
-            }
+        PublisherTrackKind::Video => {
+            state.video_frames_sent = state.video_frames_sent.saturating_add(1);
+            state.video_bytes_sent = state.video_bytes_sent.saturating_add(bytes as u64);
         }
-        state.last_send_error = None;
-        Ok(())
     }
+    state.last_send_error = None;
+    Ok(())
+}
 
-    fn track_error(
-        &self,
-        kind: &str,
-        error: impl std::fmt::Display,
-    ) -> VoicePublisherError {
-        let message = error.to_string();
-        if let Ok(mut state) = self.state.lock() {
-            state.last_send_error = Some(format!("{kind}: {message}"));
-        }
-        VoicePublisherError::Track(kind.to_owned(), message)
+fn track_error(
+    state: &Arc<Mutex<VoicePublisherState>>,
+    kind: &str,
+    error: impl std::fmt::Display,
+) -> VoicePublisherError {
+    let message = error.to_string();
+    if let Ok(mut state) = state.lock() {
+        state.last_send_error = Some(format!("{kind}: {message}"));
     }
+    VoicePublisherError::Track(kind.to_owned(), message)
 }
 
 fn build_rtc_config(config: &VoicePublisherConfig) -> RtcConfig {
@@ -347,7 +351,9 @@ fn configure_audio_packetizer(
     track
         .set_opus_packetizer(&init)
         .map_err(|error| VoicePublisherError::Track(spec.mid.clone(), error.to_string()))?;
-    try_chain_track("audio", "rtcp sr reporter", || track.chain_rtcp_sr_reporter());
+    try_chain_track("audio", "rtcp sr reporter", || {
+        track.chain_rtcp_sr_reporter()
+    });
     try_chain_track("audio", "rtcp nack responder", || {
         track.chain_rtcp_nack_responder(512)
     });
@@ -357,17 +363,18 @@ fn configure_audio_packetizer(
 fn configure_video_packetizer(
     track: &mut RtcTrack<PublisherTrackHandler>,
     spec: &TrackSpec,
-    config: &VoicePublisherConfig,
+    _config: &VoicePublisherConfig,
 ) -> Result<(), VoicePublisherError> {
     let init = packetizer_init(spec);
     track
         .set_h264_packetizer(&init)
         .map_err(|error| VoicePublisherError::Track(spec.mid.clone(), error.to_string()))?;
-    try_chain_track("video", "rtcp sr reporter", || track.chain_rtcp_sr_reporter());
+    try_chain_track("video", "rtcp sr reporter", || {
+        track.chain_rtcp_sr_reporter()
+    });
     try_chain_track("video", "rtcp nack responder", || {
         track.chain_rtcp_nack_responder(1024)
     });
-    let _ = config;
     Ok(())
 }
 
@@ -387,11 +394,7 @@ fn video_timestamp_step(spec: &TrackSpec, config: &VoicePublisherConfig) -> u32 
     clock_rate_for(spec) / config.video_framerate.max(1)
 }
 
-fn try_chain_track(
-    kind: &str,
-    chain_name: &str,
-    action: impl FnOnce() -> datachannel::Result<()>,
-) {
+fn try_chain_track(kind: &str, chain_name: &str, action: impl FnOnce() -> datachannel::Result<()>) {
     if let Err(error) = action() {
         warn!(track = kind, chain = chain_name, %error, "publisher track chaining failed");
     }
@@ -426,11 +429,19 @@ fn normalize_discord_answer_sdp(raw_sdp: &str, track_plan: &TrackPlan) -> String
     let mut fingerprint = String::new();
     let mut candidates = Vec::new();
 
-    for line in raw_sdp.lines().map(str::trim).filter(|line| !line.is_empty()) {
+    for line in raw_sdp
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
         if line.starts_with("c=") {
             connection = line.to_owned();
         } else if let Some(value) = line.strip_prefix("a=rtcp:") {
-            port = value.split_whitespace().next().unwrap_or_default().to_owned();
+            port = value
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .to_owned();
         } else if line.starts_with("a=ice-ufrag:") {
             ice_username = line.to_owned();
         } else if line.starts_with("a=ice-pwd:") {
@@ -454,7 +465,10 @@ fn normalize_discord_answer_sdp(raw_sdp: &str, track_plan: &TrackPlan) -> String
         "o=- 0 0 IN IP4 127.0.0.1".to_owned(),
         "s=-".to_owned(),
         "t=0 0".to_owned(),
-        format!("a=group:BUNDLE {} {}", track_plan.audio.mid, track_plan.video.mid),
+        format!(
+            "a=group:BUNDLE {} {}",
+            track_plan.audio.mid, track_plan.video.mid
+        ),
         "a=ice-lite".to_owned(),
         build_audio_section(
             &port,
@@ -495,7 +509,11 @@ fn build_audio_section(
     mid: &str,
 ) -> String {
     let mut lines = vec![
-        format!("m=audio {} UDP/TLS/RTP/SAVPF {}", fallback_port(port), payload_type),
+        format!(
+            "m=audio {} UDP/TLS/RTP/SAVPF {}",
+            fallback_port(port),
+            payload_type
+        ),
         fallback_connection(connection),
         "a=extmap:1 urn:ietf:params:rtp-hdrext:ssrc-audio-level".to_owned(),
         "a=extmap:3 http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01"
@@ -608,21 +626,22 @@ struct PublisherTrackHandler {
 }
 
 impl TrackHandler for PublisherTrackHandler {
-    fn set_open_state(&self, open: bool) {
+    fn on_open(&mut self) {
         if let Ok(mut state) = self.state.lock() {
             match self.kind {
-                PublisherTrackKind::Audio => state.audio_track_open = open,
-                PublisherTrackKind::Video => state.video_track_open = open,
+                PublisherTrackKind::Audio => state.audio_track_open = true,
+                PublisherTrackKind::Video => state.video_track_open = true,
             }
         }
     }
 
-    fn on_open(&mut self) {
-        self.set_open_state(true);
-    }
-
     fn on_closed(&mut self) {
-        self.set_open_state(false);
+        if let Ok(mut state) = self.state.lock() {
+            match self.kind {
+                PublisherTrackKind::Audio => state.audio_track_open = false,
+                PublisherTrackKind::Video => state.video_track_open = false,
+            }
+        }
     }
 
     fn on_error(&mut self, err: &str) {

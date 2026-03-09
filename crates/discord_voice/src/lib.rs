@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use dave::{DaveControl, DaveInitConfig, DaveProposalResult, ProposalOp};
+use dave::{DaveControl, DaveError, DaveInitConfig, DaveProposalResult, ProposalOp};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -471,9 +471,9 @@ where
                 let transition_id = u16::from_be_bytes([payload[3], payload[4]]);
                 self.handle_transition_result(
                     transition_id,
-                    self.dave.process_commit(&payload[5..]),
+                    self.dave.process_commit(&payload[5..]).map(|_| ()),
                     "commit",
-                )?
+                )
             }
             VOICE_BINARY_OPCODE_WELCOME => {
                 if payload.len() < 5 {
@@ -484,9 +484,9 @@ where
                 let transition_id = u16::from_be_bytes([payload[3], payload[4]]);
                 self.handle_transition_result(
                     transition_id,
-                    self.dave.process_welcome(&payload[5..]),
+                    self.dave.process_welcome(&payload[5..]).map(|_| ()),
                     "welcome",
-                )?
+                )
             }
             _ => {
                 debug!(opcode, "ignoring unsupported voice binary opcode");
@@ -518,7 +518,10 @@ where
         Ok(message)
     }
 
-    fn invalid_commit_recovery(&self, transition_id: u16) -> Result<Vec<VoiceOutbound>, VoiceError> {
+    fn invalid_commit_recovery(
+        &self,
+        transition_id: u16,
+    ) -> Result<Vec<VoiceOutbound>, VoiceError> {
         self.reinitialize_dave_session(self.state.dave_protocol_version)?;
         Ok(vec![
             VoiceOutbound::Json(json!({

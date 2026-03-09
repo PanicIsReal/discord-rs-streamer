@@ -535,10 +535,7 @@ impl AnnexBAccessUnitParser {
     }
 }
 
-fn find_annex_b_start_code(
-    bytes: &[u8],
-    start_at: usize,
-) -> Option<(usize, usize, u8)> {
+fn find_annex_b_start_code(bytes: &[u8], start_at: usize) -> Option<(usize, usize, u8)> {
     if bytes.len() < 4 {
         return None;
     }
@@ -572,8 +569,8 @@ mod tests {
     fn annex_b_parser_splits_on_aud_boundaries() {
         let mut parser = AnnexBAccessUnitParser::default();
         let stream = [
-            0, 0, 0, 1, 0x09, 0xf0, 0, 0, 0, 1, 0x67, 0x64, 0, 0, 0, 1, 0x65, 0x88, 0x84, 0,
-            0, 0, 1, 0x09, 0xf0, 0, 0, 0, 1, 0x61, 0x9a,
+            0, 0, 0, 1, 0x09, 0xf0, 0, 0, 0, 1, 0x67, 0x64, 0, 0, 0, 1, 0x65, 0x88, 0x84, 0, 0, 0,
+            1, 0x09, 0xf0, 0, 0, 0, 1, 0x61, 0x9a,
         ];
 
         let frames = parser.push(&stream);
