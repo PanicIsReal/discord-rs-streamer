@@ -1,92 +1,80 @@
 # discord-rs-streamer
 
-Clean-room Rust foundation for Discord desktop streaming transport.
+`discord-rs-streamer` is a clean-room Rust Discord streaming transport with a daemon + CLI operator surface.
 
-This repo is intended to replace the `discord-video-stream` portion of the current Neko stack. It does **not** modify Neko, own desktop capture, or own encode in v1. The first shipped slice focuses on the daemon contract, ingest wiring, pacing core, and transport boundaries that a clean-room Discord implementation will plug into.
+The current `1.0.0` release candidate supports:
+- Discord session login and channel targeting
+- voice/media negotiation
+- Discord Go Live publishing
+- Unix-socket ingest for H.264 video and Opus audio
+- a high-level `play` workflow for either:
+  - local media files
+  - X11 + Pulse capture, including the current Neko integration path
 
-## What is implemented now
+## What ships in the current release candidate
 
-- Rust workspace with the production crate boundaries
-- daemon HTTP API:
-  - `POST /v1/session/connect`
-  - `POST /v1/stream/start`
-  - `POST /v1/stream/stop`
-  - `POST /v1/dave/init`
-  - `POST /v1/dave/external-sender`
-  - `POST /v1/dave/key-package`
-  - `POST /v1/dave/proposals`
-  - `POST /v1/dave/welcome`
-  - `POST /v1/dave/commit`
-  - `GET /v1/dave/state`
-  - `GET /v1/health`
-  - `GET /v1/metrics`
-- Unix socket and stdin ingest primitives for H.264 Annex B and Opus elementary streams
-- bounded packet pacing core with counters for drops, sends, bytes, and queue pressure
-- real DAVE session control backed by the Rust MLS implementation already used in the current bridge stack
-- CLI for basic operator flow against the daemon
-- tests for pacing, ingest, and API lifecycle
+- `discord-rs-streamer-daemon`: the long-running HTTP control plane
+- `discord-rs-streamer`: the operator CLI
+- file playback through `ffmpeg` adapters
+- X11 desktop capture through `ffmpeg`
+- Pulse audio capture through `ffmpeg`
+- DAVE session handling
+- container packaging for the Neko integration stack
 
-## What is intentionally not implemented yet
-
-- real Discord gateway login/session handling
-- real voice/stage stream negotiation
-- RTP/RTCP wire compatibility with Discord
-
-Those pieces are represented as explicit traits and state machines so they can be implemented without reworking the daemon contract.
+The quickest way to understand the surface area is the operator guide in [`docs/operator-guide.md`](docs/operator-guide.md).
 
 ## Quick start
 
-Run the daemon:
+Stream a local file:
 
 ```bash
-cargo run -p daemon
+cargo run -p cli -- play \
+  --input /path/to/video.mp4 \
+  --token "$DISCORD_TOKEN" \
+  --guild-id "$DISCORD_GUILD_ID" \
+  --channel-id "$DISCORD_CHANNEL_ID"
 ```
 
-Inspect health:
+Stream an X11 desktop with Pulse audio:
+
+```bash
+cargo run -p cli -- play \
+  --x11-display :99.0 \
+  --pulse-source audio_output.monitor \
+  --token "$DISCORD_TOKEN" \
+  --guild-id "$DISCORD_GUILD_ID" \
+  --channel-id "$DISCORD_CHANNEL_ID"
+```
+
+Inspect daemon health:
 
 ```bash
 curl http://127.0.0.1:7331/v1/health
+curl http://127.0.0.1:7331/v1/media/health
 ```
 
-Connect a prototype session:
+## Security and publishing hygiene
 
-```bash
-cargo run -p cli -- session connect \
-  --token demo-token \
-  --guild-id 123 \
-  --channel-id 456
-```
-
-Start a Unix-socket ingest source:
-
-```bash
-cargo run -p cli -- stream start \
-  --source unix \
-  --video-socket /tmp/discord-rs-streamer/video.sock \
-  --audio-socket /tmp/discord-rs-streamer/audio.sock
-```
-
-Initialize DAVE and create a key package:
-
-```bash
-cargo run -p cli -- dave init --protocol-version 1 --user-id 42 --channel-id 7
-cargo run -p cli -- dave key-package
-```
+- Do not commit live `.env` files or personal tokens.
+- The CLI accepts `--token`, but production use should prefer environment injection or container env wiring.
+- Local logs, release zips, and other operator artifacts are intentionally ignored by [`.gitignore`](.gitignore).
+- The Neko integration repo keeps the token in local `.env`; it is not expected to be committed.
 
 ## Layout
 
-- `crates/discord_gateway`: clean-room session/gateway abstractions
-- `crates/discord_transport`: pacing, queueing, transport loop
-- `crates/dave`: encryption boundary
-- `crates/media_ingest`: encoded-media ingest primitives and harness helpers
-- `crates/daemon`: HTTP daemon and orchestration
-- `crates/cli`: operator CLI
-- `crates/test_harness`: mocks and test helpers
-- `docs/`: architecture and clean-room notes
+- `crates/discord_gateway`: Discord session and gateway abstractions
+- `crates/discord_voice`: voice gateway and WebRTC publisher/session logic
+- `crates/discord_transport`: packet pacing and transport metrics
+- `crates/dave`: DAVE session control
+- `crates/media_ingest`: encoded-media ingest primitives
+- `crates/daemon`: daemon HTTP API and orchestration
+- `crates/cli`: CLI, ingest helpers, and `play` workflow
+- `docs/`: operator, architecture, and clean-room notes
+- `docker/`: container entrypoint wiring
 
 ## Development
 
 ```bash
 cargo test
-cargo clippy --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
 ```

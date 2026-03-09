@@ -1,3 +1,7 @@
 .git
 target
+.env
+.env.*
 *.log
+firebase-debug.log
+release

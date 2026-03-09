@@ -6,14 +6,21 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[[bin]]
+name = "discord-rs-streamer"
+path = "src/main.rs"
+
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
 daemon = { path = "../daemon" }
 discord_gateway = { path = "../discord_gateway" }
 media_ingest = { path = "../media_ingest" }
-ogg = "0.9.2"
+ogg = { version = "0.9.2", features = ["async"] }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tempfile.workspace = true
 tokio.workspace = true
+tokio-stream.workspace = true
+url.workspace = true

@@ -1,16 +1,15 @@
+mod ingest;
+mod play;
+
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use daemon::{DaveInitRequest, IngestSource, SessionConnectRequest, StreamStartRequest};
 use discord_gateway::StreamKind as GatewayStreamKind;
 use media_ingest::{IngestProtocol, MediaKind};
-use ogg::PacketReader;
 use reqwest::RequestBuilder;
-use tokio::{
-    io::{self, AsyncReadExt, AsyncWriteExt},
-    net::UnixStream,
-    time::{Duration, sleep},
-};
+
+use crate::ingest::{send_framed, send_h264_annex_b, send_ogg_opus};
 
 #[derive(Debug, Parser)]
 #[command(name = "discord-rs-streamer")]
@@ -24,6 +23,7 @@ struct Args {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    Play(play::PlayCommand),
     Session(SessionCommand),
     Stream(StreamCommand),
     Ingest(IngestCommand),
@@ -166,9 +166,18 @@ enum DaveSubcommand {
 }
 
 #[derive(Debug, Clone, ValueEnum)]
-enum StreamKindArg {
+pub(crate) enum StreamKindArg {
     GoLive,
     Camera,
+}
+
+impl From<StreamKindArg> for GatewayStreamKind {
+    fn from(value: StreamKindArg) -> Self {
+        match value {
+            StreamKindArg::GoLive => GatewayStreamKind::GoLive,
+            StreamKindArg::Camera => GatewayStreamKind::Camera,
+        }
+    }
 }
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -195,6 +204,9 @@ async fn main() -> anyhow::Result<()> {
     let client = reqwest::Client::new();
 
     match args.command {
+        Command::Play(play_command) => {
+            play::run(play_command, args.daemon_url).await?;
+        }
         Command::Session(session) => match session.command {
             SessionSubcommand::Connect {
                 token,
@@ -208,7 +220,7 @@ async fn main() -> anyhow::Result<()> {
                         token,
                         guild_id,
                         channel_id,
-                        stream_kind: map_stream_kind(stream_kind),
+                        stream_kind: stream_kind.into(),
                     });
                 send_text_response(request).await?;
             }
@@ -231,11 +243,11 @@ async fn main() -> anyhow::Result<()> {
                     .post(format!("{}/v1/stream/start", args.daemon_url))
                     .json(&StreamStartRequest {
                         source_name,
-                        source: map_source(source),
+                        source: source.into(),
                         video_socket,
                         audio_socket,
-                        stdin_media_kind: stdin_media_kind.map(map_media_kind),
-                        ingest_protocol: ingest_protocol.map(map_ingest_protocol),
+                        stdin_media_kind: stdin_media_kind.map(Into::into),
+                        ingest_protocol: ingest_protocol.map(Into::into),
                         read_chunk_size: None,
                         pacing_bps,
                         pacing_window_ms: None,
@@ -354,230 +366,29 @@ async fn send_text_response(request: RequestBuilder) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn send_framed(
-    socket: String,
-    input: Option<PathBuf>,
-    repeat: u32,
-    interval_ms: u64,
-) -> anyhow::Result<()> {
-    let attempts = repeat.max(1);
-    let payload = match input {
-        Some(path) => tokio::fs::read(path).await?,
-        None => {
-            let mut payload = Vec::new();
-            io::stdin().read_to_end(&mut payload).await?;
-            payload
-        }
-    };
-    let mut stream = UnixStream::connect(socket).await?;
-    for attempt in 0..attempts {
-        write_framed_packet(&mut stream, &payload).await?;
-        if attempt + 1 < attempts && interval_ms > 0 {
-            sleep(Duration::from_millis(interval_ms)).await;
+impl From<IngestSourceArg> for IngestSource {
+    fn from(value: IngestSourceArg) -> Self {
+        match value {
+            IngestSourceArg::Unix => IngestSource::Unix,
+            IngestSourceArg::Stdin => IngestSource::Stdin,
         }
     }
-    Ok(())
 }
 
-async fn send_ogg_opus(socket: String, input: PathBuf, interval_ms: u64) -> anyhow::Result<()> {
-    let file = std::fs::File::open(input)?;
-    let mut reader = PacketReader::new(file);
-    let mut stream = UnixStream::connect(socket).await?;
-    let mut header_packets_seen = 0_u8;
-
-    while let Some(packet) = reader.read_packet()? {
-        if packet.first_in_stream() || header_packets_seen < 2 {
-            header_packets_seen = header_packets_seen.saturating_add(1);
-            continue;
-        }
-
-        write_framed_packet(&mut stream, &packet.data).await?;
-        if interval_ms > 0 {
-            sleep(Duration::from_millis(interval_ms)).await;
+impl From<MediaKindArg> for MediaKind {
+    fn from(value: MediaKindArg) -> Self {
+        match value {
+            MediaKindArg::Video => MediaKind::Video,
+            MediaKindArg::Audio => MediaKind::Audio,
         }
     }
-
-    Ok(())
 }
 
-async fn send_h264_annex_b(
-    socket: String,
-    input: Option<PathBuf>,
-    read_chunk_size: usize,
-) -> anyhow::Result<()> {
-    anyhow::ensure!(read_chunk_size > 0, "read_chunk_size must be positive");
-    let mut stream = UnixStream::connect(socket).await?;
-    let mut reader: Box<dyn tokio::io::AsyncRead + Unpin + Send> = match input {
-        Some(path) => Box::new(tokio::fs::File::open(path).await?),
-        None => Box::new(io::stdin()),
-    };
-
-    let mut read_buf = vec![0_u8; read_chunk_size];
-    let mut parser = AnnexBAccessUnitParser::default();
-
-    loop {
-        let bytes_read = reader.read(&mut read_buf).await?;
-        if bytes_read == 0 {
-            break;
+impl From<IngestProtocolArg> for IngestProtocol {
+    fn from(value: IngestProtocolArg) -> Self {
+        match value {
+            IngestProtocolArg::Raw => IngestProtocol::Raw,
+            IngestProtocolArg::Framed => IngestProtocol::Framed,
         }
-
-        let access_units = parser.push(&read_buf[..bytes_read]);
-        for access_unit in access_units {
-            write_framed_packet(&mut stream, &access_unit).await?;
-        }
-    }
-
-    if let Some(access_unit) = parser.finish() {
-        write_framed_packet(&mut stream, &access_unit).await?;
-    }
-
-    Ok(())
-}
-
-async fn write_framed_packet(stream: &mut UnixStream, payload: &[u8]) -> anyhow::Result<()> {
-    stream
-        .write_all(&(payload.len() as u32).to_be_bytes())
-        .await?;
-    stream.write_all(payload).await?;
-    Ok(())
-}
-
-fn map_stream_kind(value: StreamKindArg) -> GatewayStreamKind {
-    match value {
-        StreamKindArg::GoLive => GatewayStreamKind::GoLive,
-        StreamKindArg::Camera => GatewayStreamKind::Camera,
-    }
-}
-
-fn map_source(value: IngestSourceArg) -> IngestSource {
-    match value {
-        IngestSourceArg::Unix => IngestSource::Unix,
-        IngestSourceArg::Stdin => IngestSource::Stdin,
-    }
-}
-
-fn map_media_kind(value: MediaKindArg) -> MediaKind {
-    match value {
-        MediaKindArg::Video => MediaKind::Video,
-        MediaKindArg::Audio => MediaKind::Audio,
-    }
-}
-
-fn map_ingest_protocol(value: IngestProtocolArg) -> IngestProtocol {
-    match value {
-        IngestProtocolArg::Raw => IngestProtocol::Raw,
-        IngestProtocolArg::Framed => IngestProtocol::Framed,
-    }
-}
-
-#[derive(Default)]
-struct AnnexBAccessUnitParser {
-    buffer: Vec<u8>,
-    frame_start: Option<usize>,
-    scan_offset: usize,
-}
-
-impl AnnexBAccessUnitParser {
-    fn push(&mut self, bytes: &[u8]) -> Vec<Vec<u8>> {
-        self.buffer.extend_from_slice(bytes);
-        self.drain_complete_access_units(false)
-    }
-
-    fn finish(&mut self) -> Option<Vec<u8>> {
-        let mut frames = self.drain_complete_access_units(true);
-        frames.pop()
-    }
-
-    fn drain_complete_access_units(&mut self, flush: bool) -> Vec<Vec<u8>> {
-        let mut frames = Vec::new();
-
-        while let Some((start, start_code_len, nal_header)) =
-            find_annex_b_start_code(&self.buffer, self.scan_offset)
-        {
-            let nal_type = nal_header & 0x1f;
-            if nal_type == 9 {
-                if let Some(frame_start) = self.frame_start
-                    && start > frame_start
-                {
-                    frames.push(self.buffer[frame_start..start].to_vec());
-                }
-                self.frame_start = Some(start);
-            } else if self.frame_start.is_none() {
-                self.frame_start = Some(start);
-            }
-
-            self.scan_offset = start + start_code_len + 1;
-        }
-
-        if let Some(frame_start) = self.frame_start {
-            if frame_start > 0 {
-                self.buffer.drain(..frame_start);
-                self.scan_offset = self.scan_offset.saturating_sub(frame_start);
-                self.frame_start = Some(0);
-            }
-        } else if self.buffer.len() > 4 {
-            let keep_from = self.buffer.len() - 4;
-            self.buffer.drain(..keep_from);
-            self.scan_offset = self.scan_offset.saturating_sub(keep_from);
-        }
-
-        if flush {
-            if let Some(frame_start) = self.frame_start.take()
-                && self.buffer.len() > frame_start
-            {
-                frames.push(self.buffer[frame_start..].to_vec());
-            }
-            self.buffer.clear();
-            self.scan_offset = 0;
-        }
-
-        frames
-    }
-}
-
-fn find_annex_b_start_code(bytes: &[u8], start_at: usize) -> Option<(usize, usize, u8)> {
-    if bytes.len() < 4 {
-        return None;
-    }
-
-    let mut index = start_at.min(bytes.len().saturating_sub(4));
-    while index + 3 < bytes.len() {
-        let (start_code_len, nal_header_index) = if bytes[index..].starts_with(&[0, 0, 1]) {
-            (3, index + 3)
-        } else if bytes[index..].starts_with(&[0, 0, 0, 1]) {
-            (4, index + 4)
-        } else {
-            index += 1;
-            continue;
-        };
-
-        if nal_header_index < bytes.len() {
-            return Some((index, start_code_len, bytes[nal_header_index]));
-        }
-
-        return None;
-    }
-
-    None
-}
-
-#[cfg(test)]
-mod tests {
-    use super::AnnexBAccessUnitParser;
-
-    #[test]
-    fn annex_b_parser_splits_on_aud_boundaries() {
-        let mut parser = AnnexBAccessUnitParser::default();
-        let stream = [
-            0, 0, 0, 1, 0x09, 0xf0, 0, 0, 0, 1, 0x67, 0x64, 0, 0, 0, 1, 0x65, 0x88, 0x84, 0, 0, 0,
-            1, 0x09, 0xf0, 0, 0, 0, 1, 0x61, 0x9a,
-        ];
-
-        let frames = parser.push(&stream);
-        assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0], stream[..19].to_vec());
-
-        let final_frame = parser.finish().expect("last frame");
-        assert_eq!(final_frame, stream[19..].to_vec());
     }
 }

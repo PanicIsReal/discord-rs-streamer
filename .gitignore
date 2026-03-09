@@ -2,6 +2,10 @@
 /.idea
 /.vscode
 /.DS_Store
+.env
+.env.*
 *.sock
 *.log
+firebase-debug.log
+release/
 fixtures/tmp/

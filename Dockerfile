@@ -31,10 +31,11 @@ RUN apt-get update \
 WORKDIR /app
 
 COPY --from=builder /app/target/release/daemon /usr/local/bin/discord-rs-streamer-daemon
-COPY --from=builder /app/target/release/cli /usr/local/bin/discord-rs-streamer-cli
+COPY --from=builder /app/target/release/discord-rs-streamer /usr/local/bin/discord-rs-streamer
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 
-RUN chmod +x /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh \
+    && ln -sf /usr/local/bin/discord-rs-streamer /usr/local/bin/discord-rs-streamer-cli
 
 ENV DISCORD_RS_STREAMER_BIND=0.0.0.0:7331
 
