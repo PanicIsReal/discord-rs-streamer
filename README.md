@@ -28,22 +28,24 @@ The quickest way to understand the surface area is the operator guide in [`docs/
 Stream a local file:
 
 ```bash
+export DISCORD_TOKEN=...
+export DISCORD_GUILD_ID=...
+export DISCORD_CHANNEL_ID=...
+
 cargo run -p cli -- play \
-  --input /path/to/video.mp4 \
-  --token "$DISCORD_TOKEN" \
-  --guild-id "$DISCORD_GUILD_ID" \
-  --channel-id "$DISCORD_CHANNEL_ID"
+  --input /path/to/video.mp4
 ```
 
 Stream an X11 desktop with Pulse audio:
 
 ```bash
+export DISCORD_TOKEN=...
+export DISCORD_GUILD_ID=...
+export DISCORD_CHANNEL_ID=...
+
 cargo run -p cli -- play \
   --x11-display :99.0 \
-  --pulse-source audio_output.monitor \
-  --token "$DISCORD_TOKEN" \
-  --guild-id "$DISCORD_GUILD_ID" \
-  --channel-id "$DISCORD_CHANNEL_ID"
+  --pulse-source audio_output.monitor
 ```
 
 Inspect daemon health:
@@ -56,7 +58,7 @@ curl http://127.0.0.1:7331/v1/media/health
 ## Security and publishing hygiene
 
 - Do not commit live `.env` files or personal tokens.
-- The CLI accepts `--token`, but production use should prefer environment injection or container env wiring.
+- The CLI accepts `--token`, but production use should prefer environment injection or container env wiring so secrets do not appear in process arguments.
 - Local logs, release zips, and other operator artifacts are intentionally ignored by [`.gitignore`](.gitignore).
 - The Neko integration repo keeps the token in local `.env`; it is not expected to be committed.
 

@@ -40,9 +40,6 @@ args=(
   --daemon-url "${DAEMON_URL}"
   play
   --daemon-bind "${DAEMON_BIND}"
-  --token "${DISCORD_TOKEN}"
-  --guild-id "${DISCORD_GUILD_ID}"
-  --channel-id "${DISCORD_CHANNEL_ID}"
   --stream-kind "${STREAM_KIND}"
   --ffmpeg-bin "${FFMPEG_BIN}"
   --fps "${STREAM_FPS}"

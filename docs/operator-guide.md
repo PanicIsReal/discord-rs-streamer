@@ -16,20 +16,22 @@ The CLI is the operator surface. The normal command is `play`. The rest of the c
 For normal use, run one of these:
 
 ```bash
+export DISCORD_TOKEN=...
+export DISCORD_GUILD_ID=...
+export DISCORD_CHANNEL_ID=...
+
 discord-rs-streamer play \
-  --input /path/to/file.mp4 \
-  --token "$DISCORD_TOKEN" \
-  --guild-id "$DISCORD_GUILD_ID" \
-  --channel-id "$DISCORD_CHANNEL_ID"
+  --input /path/to/file.mp4
 ```
 
 ```bash
+export DISCORD_TOKEN=...
+export DISCORD_GUILD_ID=...
+export DISCORD_CHANNEL_ID=...
+
 discord-rs-streamer play \
   --x11-display :99.0 \
-  --pulse-source audio_output.monitor \
-  --token "$DISCORD_TOKEN" \
-  --guild-id "$DISCORD_GUILD_ID" \
-  --channel-id "$DISCORD_CHANNEL_ID"
+  --pulse-source audio_output.monitor
 ```
 
 `play` will:
@@ -47,6 +49,8 @@ Environment fallback is supported for:
 - `DISCORD_TOKEN`
 - `DISCORD_GUILD_ID`
 - `DISCORD_CHANNEL_ID`
+
+Prefer environment injection over `--token` in production so the token does not appear in process arguments or shell history.
 
 ## What the daemon does
 
