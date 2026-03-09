@@ -23,6 +23,13 @@ The current `1.0.0` release candidate supports:
 
 The quickest way to understand the surface area is the operator guide in [`docs/operator-guide.md`](docs/operator-guide.md).
 
+## Legal and usage notice
+
+- This project is licensed under the MIT License. See [`LICENSE`](LICENSE).
+- Using a Discord user token with automation or selfbot-style tooling may violate Discord's Terms of Service.
+- Anyone choosing to use this repository with a user token does so at their own discretion and assumes the associated risk.
+- The authors and maintainers are not liable for account suspension, termination, lockout, data loss, or any other enforcement or damage that may result from personal token usage or Discord policy violations.
+
 ## Quick start
 
 Stream a local file:
