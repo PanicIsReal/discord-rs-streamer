@@ -4,11 +4,12 @@ use std::{
     net::IpAddr,
     path::{Path, PathBuf},
     process::Stdio,
+    sync::Arc,
 };
 
 use anyhow::{Context, anyhow, bail};
 use clap::{ArgGroup, Parser};
-use daemon::{IngestSource, SessionConnectRequest, StreamStartRequest};
+use daemon::{IngestSource, MediaConnectRequest, MediaProfile, SessionConnectRequest, StreamStartRequest};
 use discord_gateway::StreamKind as GatewayStreamKind;
 use media_ingest::IngestProtocol;
 use reqwest::Client;
@@ -25,12 +26,13 @@ use url::{Host, Url};
 
 use crate::{
     StreamKindArg,
-    ingest::{forward_h264_annex_b_reader_to_stream, forward_ogg_opus_reader_to_stream},
+    ingest::{MediaTimeline, forward_h264_annex_b_reader_to_stream, forward_ogg_opus_reader_to_stream},
 };
 
 const DEFAULT_DAEMON_URL: &str = "http://127.0.0.1:7331";
 const DEFAULT_DAEMON_BIND: &str = "127.0.0.1:7331";
 const DEFAULT_PULSE_SOURCE: &str = "audio_output.monitor";
+const DEFAULT_AUDIO_PAGE_DURATION_US: u64 = 20_000;
 const DEFAULT_SOURCE_NAME_FILE: &str = "play-file";
 const DEFAULT_SOURCE_NAME_X11: &str = "play-x11";
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(60);
@@ -38,6 +40,7 @@ const HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const SOCKET_CONNECT_ATTEMPTS: usize = 60;
 const SOCKET_CONNECT_INTERVAL: Duration = Duration::from_millis(250);
 const ANNEX_B_READ_CHUNK_SIZE: usize = 64 * 1024;
+const DEFAULT_AUDIO_FRAME_DURATION_MS: u32 = 20;
 
 #[derive(Debug, Parser)]
 #[command(about = "Start a Discord stream from a local file or an X11/Pulse capture source")]
@@ -285,7 +288,7 @@ async fn run_playback(
     connect_session(client, config).await?;
     cleanup.voice_connected = true;
 
-    connect_media(client, &config.daemon_url).await?;
+    connect_media(client, config).await?;
     cleanup.media_connected = true;
 
     let file_audio_present = match &config.source {
@@ -377,9 +380,19 @@ async fn connect_session(client: &Client, config: &PlayConfig) -> anyhow::Result
     ensure_success(response, "session connect").await
 }
 
-async fn connect_media(client: &Client, daemon_url: &str) -> anyhow::Result<()> {
+async fn connect_media(client: &Client, config: &PlayConfig) -> anyhow::Result<()> {
+    let profile = MediaProfile {
+        width: config.width,
+        height: config.height,
+        max_framerate: config.fps.max(1),
+        max_bitrate_bps: config.video_bitrate_kbps.saturating_mul(1000),
+        audio_frame_duration_ms: DEFAULT_AUDIO_FRAME_DURATION_MS,
+        keyframe_interval_seconds: config.keyframe_interval_seconds.max(1),
+    };
+
     let response = client
-        .post(format!("{daemon_url}/v1/media/connect"))
+        .post(format!("{}/v1/media/connect", config.daemon_url))
+        .json(&MediaConnectRequest { profile })
         .send()
         .await
         .context("failed to connect media")?;
@@ -560,6 +573,8 @@ async fn spawn_pipeline(
     audio_socket: Option<&Path>,
     file_audio_present: bool,
 ) -> anyhow::Result<PlaybackPipeline> {
+    let timeline = Arc::new(MediaTimeline::new());
+    let video_frame_duration_us = 1_000_000_u64 / u64::from(config.fps.max(1));
     let video_stream = connect_socket(video_socket).await?;
     let video = match &config.source {
         PlaySource::File(input) => {
@@ -568,6 +583,8 @@ async fn spawn_pipeline(
                 &config.ffmpeg_bin,
                 video_stream,
                 "video",
+                Arc::clone(&timeline),
+                video_frame_duration_us,
             )
             .await?
         }
@@ -577,12 +594,15 @@ async fn spawn_pipeline(
                 &config.ffmpeg_bin,
                 video_stream,
                 "video",
+                Arc::clone(&timeline),
+                video_frame_duration_us,
             )
             .await?
         }
     };
 
-    let audio = spawn_audio_pipeline_if_needed(config, audio_socket, file_audio_present).await?;
+    let audio =
+        spawn_audio_pipeline_if_needed(config, audio_socket, file_audio_present, timeline).await?;
 
     Ok(PlaybackPipeline { video, audio })
 }
@@ -591,6 +611,7 @@ async fn spawn_audio_pipeline_if_needed(
     config: &PlayConfig,
     audio_socket: Option<&Path>,
     file_audio_present: bool,
+    timeline: Arc<MediaTimeline>,
 ) -> anyhow::Result<Option<PipelineTask>> {
     let Some(audio_socket) = audio_socket else {
         return Ok(None);
@@ -609,6 +630,7 @@ async fn spawn_audio_pipeline_if_needed(
                 build_file_audio_args(config, input),
                 &config.ffmpeg_bin,
                 stream,
+                Arc::clone(&timeline),
             )
             .await
             .map(Some)
@@ -622,6 +644,7 @@ async fn spawn_audio_pipeline_if_needed(
                 ),
                 &config.ffmpeg_bin,
                 stream,
+                Arc::clone(&timeline),
             )
             .await
             .map(Some)
@@ -641,6 +664,8 @@ async fn spawn_video_pipeline(
     ffmpeg_bin: &str,
     mut stream: UnixStream,
     name: &'static str,
+    timeline: Arc<MediaTimeline>,
+    video_frame_duration_us: u64,
 ) -> anyhow::Result<PipelineTask> {
     let mut child = spawn_ffmpeg(ffmpeg_bin, args, name)?;
     let stdout = child
@@ -648,7 +673,14 @@ async fn spawn_video_pipeline(
         .take()
         .ok_or_else(|| anyhow!("{name} ffmpeg stdout was not piped"))?;
     let forwarder = tokio::spawn(async move {
-        forward_h264_annex_b_reader_to_stream(stdout, &mut stream, ANNEX_B_READ_CHUNK_SIZE).await
+        forward_h264_annex_b_reader_to_stream(
+            stdout,
+            &mut stream,
+            ANNEX_B_READ_CHUNK_SIZE,
+            Some(timeline),
+            Some(video_frame_duration_us),
+        )
+        .await
     });
     Ok(PipelineTask {
         name,
@@ -661,16 +693,16 @@ async fn spawn_audio_pipeline(
     args: Vec<OsString>,
     ffmpeg_bin: &str,
     mut stream: UnixStream,
+    timeline: Arc<MediaTimeline>,
 ) -> anyhow::Result<PipelineTask> {
     let mut child = spawn_ffmpeg(ffmpeg_bin, args, "audio")?;
     let stdout = child
         .stdout
         .take()
         .ok_or_else(|| anyhow!("audio ffmpeg stdout was not piped"))?;
-    let forwarder =
-        tokio::spawn(
-            async move { forward_ogg_opus_reader_to_stream(stdout, &mut stream, None).await },
-        );
+    let forwarder = tokio::spawn(async move {
+        forward_ogg_opus_reader_to_stream(stdout, &mut stream, None, Some(timeline)).await
+    });
     Ok(PipelineTask {
         name: "audio",
         child,
@@ -797,8 +829,16 @@ fn build_file_audio_args(config: &PlayConfig, input: &Path) -> Vec<OsString> {
         OsString::from("0:a:0"),
         OsString::from("-c:a"),
         OsString::from("libopus"),
+        OsString::from("-frame_duration"),
+        OsString::from(DEFAULT_AUDIO_FRAME_DURATION_MS.to_string()),
         OsString::from("-b:a"),
         OsString::from(format!("{}k", config.audio_bitrate_kbps)),
+        OsString::from("-flush_packets"),
+        OsString::from("1"),
+        OsString::from("-max_delay"),
+        OsString::from("0"),
+        OsString::from("-page_duration"),
+        OsString::from(DEFAULT_AUDIO_PAGE_DURATION_US.to_string()),
         OsString::from("-f"),
         OsString::from("ogg"),
         OsString::from("pipe:1"),
@@ -832,8 +872,16 @@ fn build_pulse_audio_args(config: &PlayConfig, pulse_source: &str) -> Vec<OsStri
         OsString::from("-vn"),
         OsString::from("-c:a"),
         OsString::from("libopus"),
+        OsString::from("-frame_duration"),
+        OsString::from(DEFAULT_AUDIO_FRAME_DURATION_MS.to_string()),
         OsString::from("-b:a"),
         OsString::from(format!("{}k", config.audio_bitrate_kbps)),
+        OsString::from("-flush_packets"),
+        OsString::from("1"),
+        OsString::from("-max_delay"),
+        OsString::from("0"),
+        OsString::from("-page_duration"),
+        OsString::from(DEFAULT_AUDIO_PAGE_DURATION_US.to_string()),
         OsString::from("-f"),
         OsString::from("ogg"),
         OsString::from("pipe:1"),
@@ -859,6 +907,8 @@ fn common_video_args(config: &PlayConfig) -> Vec<OsString> {
         .max(1);
     vec![
         OsString::from("-an"),
+        OsString::from("-r"),
+        OsString::from(config.fps.to_string()),
         OsString::from("-vf"),
         OsString::from(format!(
             "scale={}:{}:flags=lanczos,format=yuv420p",
@@ -886,6 +936,8 @@ fn common_video_args(config: &PlayConfig) -> Vec<OsString> {
         OsString::from(format!("{}k", config.video_bitrate_kbps)),
         OsString::from("-bufsize"),
         OsString::from(format!("{}k", config.video_bitrate_kbps.saturating_mul(2))),
+        OsString::from("-x264-params"),
+        OsString::from("repeat-headers=1"),
         OsString::from("-bsf:v"),
         OsString::from("h264_metadata=aud=insert"),
         OsString::from("-f"),
@@ -1048,6 +1100,9 @@ mod tests {
         let args = args_to_strings(build_file_audio_args(&config, input));
         assert!(args.windows(2).any(|pair| pair == ["-map", "0:a:0"]));
         assert!(args.windows(2).any(|pair| pair == ["-c:a", "libopus"]));
+        assert!(args.windows(2).any(|pair| pair == ["-flush_packets", "1"]));
+        assert!(args.windows(2).any(|pair| pair == ["-max_delay", "0"]));
+        assert!(args.windows(2).any(|pair| pair == ["-page_duration", "20000"]));
     }
 
     #[test]
@@ -1098,6 +1153,9 @@ mod tests {
         let args = args_to_strings(build_pulse_audio_args(&config, pulse_source));
         assert!(args.windows(2).any(|pair| pair == ["-f", "pulse"]));
         assert!(args.windows(2).any(|pair| pair == ["-i", "custom.monitor"]));
+        assert!(args.windows(2).any(|pair| pair == ["-flush_packets", "1"]));
+        assert!(args.windows(2).any(|pair| pair == ["-max_delay", "0"]));
+        assert!(args.windows(2).any(|pair| pair == ["-page_duration", "20000"]));
     }
 
     #[test]

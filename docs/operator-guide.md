@@ -13,7 +13,7 @@ The CLI is the operator surface. The normal command is `play`. The rest of the c
 
 ## Normal operator flow
 
-For normal use, run one of these:
+For normal use, set credentials and run `play` with one of these source modes:
 
 ```bash
 export DISCORD_TOKEN=...
@@ -22,13 +22,8 @@ export DISCORD_CHANNEL_ID=...
 
 discord-rs-streamer play \
   --input /path/to/file.mp4
-```
 
-```bash
-export DISCORD_TOKEN=...
-export DISCORD_GUILD_ID=...
-export DISCORD_CHANNEL_ID=...
-
+# Or capture from X11:
 discord-rs-streamer play \
   --x11-display :99.0 \
   --pulse-source audio_output.monitor
@@ -79,6 +74,22 @@ The daemon exposes these routes:
 
 In practical terms, the daemon is the long-running control plane. It keeps the live Discord and media state in memory while the CLI drives it.
 
+Recent recovery behavior:
+
+- On transient gateway drops, the daemon reconnects and retries resume before treating the session as failed.
+- If resume is rejected as non-resumable, the daemon re-identifies, resends voice state, and restarts stream-start after voice rejoin.
+- If Discord reports a resumable invalid session, the daemon retries resume before falling back to re-identify.
+- If the current user leaves the target voice channel, the daemon resends voice state and restarts streaming after resources recover.
+- If Discord rotates the active voice server while streaming, stale stream state is cleared and stream-start is replayed on the refreshed voice transport.
+- On voice or stream refresh events, stale endpoint/token state is cleared immediately to avoid mixed old/new data.
+- The daemon now only reports `streaming = true` once both `STREAM_CREATE` and `STREAM_SERVER_UPDATE` have supplied the full stream transport details, including `rtc_server_id`.
+
+Gateway trace capture:
+
+- Set `DISCORD_RS_STREAMER_GATEWAY_EVENT_LOG=/absolute/path/to/gateway-events.jsonl` before starting the daemon or running `play`.
+- The daemon will append one JSON object per line with the raw incoming gateway payload, any recovery command it sends, and a full before/after gateway state snapshot.
+- The file includes sensitive voice and stream transport tokens from Discord gateway events. Treat it like a secret.
+
 ## CLI commands
 
 ### `play`
@@ -125,6 +136,15 @@ Connects only the voice gateway layer.
 
 Shows voice gateway health.
 
+Relevant fields now include:
+
+- `connected`
+- `hello_received`
+- `ready_received`
+- `session_description_received`
+- `heartbeat_rtt_ms`
+- `reconnect_count`
+
 ### `voice state`
 
 Shows the current voice session state object.
@@ -137,15 +157,34 @@ Closes the voice session.
 
 Negotiates the media publisher and gets the stream ready to accept video/audio.
 
+The normal `play` flow now sends a media profile with:
+
+- output width and height
+- target framerate
+- target video bitrate
+- audio frame duration
+- keyframe interval
+
+The daemon uses that profile for Discord media negotiation instead of fixed internal defaults.
+If the WebRTC publisher stalls and the media session does not become ready again, the daemon will stop and restart the Discord stream session, renegotiate with the last active profile, and release startup media back into live publish queues.
+
 ### `media health`
 
-Shows the most useful live streaming debug state:
+Shows streaming debug state:
 
 - publisher connection state
 - track-open flags
 - frame counters
 - last send error
 - `streaming_announced`
+- publish queue depth for audio and video
+- startup-buffer depth and whether decoder config is retained
+- not-ready and overload drop counters
+- last keyframe age
+- per-track send jitter
+
+If startup buffers stay non-empty while `media.publisher.connection_state` is unhealthy, the daemon
+automatically attempts renegotiation before dropping buffered media.
 
 ### `media disconnect`
 
@@ -196,6 +235,8 @@ Returns overall daemon health.
 
 Returns transport, ingest, and publisher metrics.
 
+When media mode is active, publish diagnostics include both paced transport metrics and WebRTC publish metrics.
+
 ## Health checks
 
 The main runtime checks are:
@@ -214,6 +255,12 @@ Healthy stream indicators:
 - `media.publisher.connection_state = "Connected"`
 - `media.session_state.streaming_announced = true`
 - increasing `audio_frames_sent` and `video_frames_sent`
+
+If the Discord gateway drops transiently, `discord.state` can briefly enter `connecting` during resume.
+On recovery, it returns to `connected` or `streaming` without manual `session connect`.
+If resume is rejected, the daemon re-identifies, re-joins voice, and replays stream-start when needed.
+Unexpected self voice-leave events use the same voice rejoin + stream restart path.
+Voice-server rotation events also trigger a stream restart so `media_session` does not retain stale stream transport details.
 
 ## Neko integration
 

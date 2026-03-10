@@ -73,14 +73,22 @@ pub struct VoicePeerPublisher {
     audio_track: Box<RtcTrack<PublisherTrackHandler>>,
     video_track: Box<RtcTrack<PublisherTrackHandler>>,
     state: Arc<Mutex<VoicePublisherState>>,
-    audio_timestamp_step: u32,
-    video_timestamp_step: u32,
+    audio_timing_state: Option<TrackTimingState>,
+    video_timing_state: Option<TrackTimingState>,
+    audio_default_duration_us: u64,
+    video_default_duration_us: u64,
 }
 
 #[derive(Clone, Copy)]
 enum PublisherTrackKind {
     Audio,
     Video,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TrackTimingState {
+    Timed { media_origin_us: u64, rtp_origin: u32 },
+    Untimed { next_rtp_timestamp: u32 },
 }
 
 impl VoicePeerPublisher {
@@ -108,8 +116,10 @@ impl VoicePeerPublisher {
             audio_track,
             video_track,
             state,
-            audio_timestamp_step: audio_timestamp_step(&config),
-            video_timestamp_step: video_timestamp_step(&track_plan.video, &config),
+            audio_timing_state: None,
+            video_timing_state: None,
+            audio_default_duration_us: audio_duration_us(&config),
+            video_default_duration_us: video_duration_us(&config),
         })
     }
 
@@ -150,26 +160,67 @@ impl VoicePeerPublisher {
             .map_err(|error| VoicePublisherError::PeerConnection(error.to_string()))
     }
 
-    pub fn send_audio(&mut self, payload: &[u8]) -> Result<(), VoicePublisherError> {
-        send_track(
-            &mut self.audio_track,
+    pub fn send_audio(
+        &mut self,
+        payload: &[u8],
+        capture_time_us: u64,
+        duration_us: u64,
+    ) -> Result<(), VoicePublisherError> {
+        self.send_track(
             payload,
-            self.audio_timestamp_step,
+            capture_time_us,
+            duration_us,
             PublisherTrackKind::Audio,
-            &self.state,
-        )?;
-        Ok(())
+            self.audio_default_duration_us,
+        )
     }
 
-    pub fn send_video(&mut self, payload: &[u8]) -> Result<(), VoicePublisherError> {
-        send_track(
-            &mut self.video_track,
+    pub fn send_video(
+        &mut self,
+        payload: &[u8],
+        capture_time_us: u64,
+        duration_us: u64,
+    ) -> Result<(), VoicePublisherError> {
+        self.send_track(
             payload,
-            self.video_timestamp_step,
+            capture_time_us,
+            duration_us,
             PublisherTrackKind::Video,
+            self.video_default_duration_us,
+        )
+    }
+
+    fn send_track(
+        &mut self,
+        payload: &[u8],
+        capture_time_us: u64,
+        duration_us: u64,
+        track_kind: PublisherTrackKind,
+        default_duration_us: u64,
+    ) -> Result<(), VoicePublisherError> {
+        let (track, timing_state, clock_rate) = match track_kind {
+            PublisherTrackKind::Audio => (
+                &mut self.audio_track,
+                &mut self.audio_timing_state,
+                48_000_u32,
+            ),
+            PublisherTrackKind::Video => (
+                &mut self.video_track,
+                &mut self.video_timing_state,
+                90_000_u32,
+            ),
+        };
+        send_track(
+            track,
+            payload,
+            timing_state,
+            capture_time_us,
+            duration_us,
+            default_duration_us,
+            clock_rate,
+            track_kind,
             &self.state,
-        )?;
-        Ok(())
+        )
     }
 
     pub fn state(&self) -> Result<VoicePublisherState, VoicePublisherError> {
@@ -192,7 +243,7 @@ impl VoicePeerPublisher {
         }
     }
 
-    fn is_ready(&self) -> Result<bool, VoicePublisherError> {
+    pub fn is_ready(&self) -> Result<bool, VoicePublisherError> {
         is_track_ready(&self.state)
     }
 }
@@ -207,7 +258,11 @@ fn is_track_ready(state: &Arc<Mutex<VoicePublisherState>>) -> Result<bool, Voice
 fn send_track(
     track: &mut RtcTrack<PublisherTrackHandler>,
     payload: &[u8],
-    timestamp_step: u32,
+    timing_state: &mut Option<TrackTimingState>,
+    capture_time_us: u64,
+    duration_us: u64,
+    default_duration_us: u64,
+    clock_rate: u32,
     kind: PublisherTrackKind,
     state: &Arc<Mutex<VoicePublisherState>>,
 ) -> Result<(), VoicePublisherError> {
@@ -217,10 +272,20 @@ fn send_track(
         ));
     }
 
+    let packet_timestamp = resolve_packet_timestamp(
+        track,
+        timing_state,
+        capture_time_us,
+        duration_us,
+        default_duration_us,
+        clock_rate,
+    )
+    .map_err(|error| track_error(state, track_label(kind), error))?;
+    track
+        .set_rtp_timestamp(packet_timestamp)
+        .map_err(|error| track_error(state, track_label(kind), error))?;
     track
         .send(payload)
-        .map_err(|error| track_error(state, track_label(kind), error))?;
-    advance_track_timestamp(track, timestamp_step)
         .map_err(|error| track_error(state, track_label(kind), error))?;
     record_send(kind, payload.len(), state)
 }
@@ -378,20 +443,37 @@ fn configure_video_packetizer(
     Ok(())
 }
 
-fn advance_track_timestamp(
+fn resolve_packet_timestamp(
     track: &mut RtcTrack<PublisherTrackHandler>,
-    step: u32,
-) -> datachannel::Result<()> {
-    let next = track.current_rtp_timestamp()?.wrapping_add(step);
-    track.set_rtp_timestamp(next)
+    timing_state: &mut Option<TrackTimingState>,
+    capture_time_us: u64,
+    duration_us: u64,
+    default_duration_us: u64,
+    clock_rate: u32,
+) -> datachannel::Result<u32> {
+    let current_track_timestamp = track.current_rtp_timestamp()?;
+    Ok(resolve_packet_timestamp_from_state(
+        timing_state,
+        current_track_timestamp,
+        capture_time_us,
+        duration_us,
+        default_duration_us,
+        clock_rate,
+    ))
 }
 
-fn audio_timestamp_step(config: &VoicePublisherConfig) -> u32 {
-    48_000_u32.saturating_mul(config.audio_frame_duration_ms.max(1)) / 1_000
+fn duration_to_rtp_ticks(duration_us: u64, clock_rate: u32) -> u32 {
+    duration_us
+        .saturating_mul(u64::from(clock_rate))
+        .saturating_div(1_000_000) as u32
 }
 
-fn video_timestamp_step(spec: &TrackSpec, config: &VoicePublisherConfig) -> u32 {
-    clock_rate_for(spec) / config.video_framerate.max(1)
+fn audio_duration_us(config: &VoicePublisherConfig) -> u64 {
+    u64::from(config.audio_frame_duration_ms.max(1)).saturating_mul(1_000)
+}
+
+fn video_duration_us(config: &VoicePublisherConfig) -> u64 {
+    1_000_000_u64 / u64::from(config.video_framerate.max(1))
 }
 
 fn try_chain_track(kind: &str, chain_name: &str, action: impl FnOnce() -> datachannel::Result<()>) {
@@ -709,7 +791,11 @@ fn _assert_result_type<T>(value: DcResult<T>) -> DcResult<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::{VoicePublisherState, publisher_ready};
+    use super::{
+        TrackTimingState, VoicePublisherState, audio_duration_us, duration_to_rtp_ticks,
+        publisher_ready, resolve_packet_timestamp_from_state,
+    };
+    use crate::publisher::VoicePublisherConfig;
 
     #[test]
     fn publisher_ready_requires_connected_and_open_tracks() {
@@ -729,5 +815,104 @@ mod tests {
             ..connected.clone()
         };
         assert!(!publisher_ready(&missing_video));
+    }
+
+    #[test]
+    fn untimed_packets_advance_by_default_duration() {
+        let mut timing_state = None;
+        let default_duration_us = audio_duration_us(&VoicePublisherConfig::default());
+
+        let first = resolve_packet_timestamp_from_state(
+            &mut timing_state,
+            12_345,
+            0,
+            0,
+            default_duration_us,
+            48_000,
+        );
+        let second = resolve_packet_timestamp_from_state(
+            &mut timing_state,
+            12_345,
+            0,
+            0,
+            default_duration_us,
+            48_000,
+        );
+
+        assert_eq!(first, 12_345);
+        assert_eq!(second, 12_345 + duration_to_rtp_ticks(default_duration_us, 48_000));
+        assert!(matches!(timing_state, Some(TrackTimingState::Untimed { .. })));
+    }
+
+    #[test]
+    fn timed_packets_use_capture_time_deltas() {
+        let mut timing_state = None;
+
+        let first = resolve_packet_timestamp_from_state(
+            &mut timing_state,
+            50_000,
+            1_000_000,
+            20_000,
+            20_000,
+            48_000,
+        );
+        let second = resolve_packet_timestamp_from_state(
+            &mut timing_state,
+            50_000,
+            1_020_000,
+            20_000,
+            20_000,
+            48_000,
+        );
+
+        assert_eq!(first, 50_000);
+        assert_eq!(second, 50_000 + duration_to_rtp_ticks(20_000, 48_000));
+        assert!(matches!(timing_state, Some(TrackTimingState::Timed { .. })));
+    }
+}
+
+fn resolve_packet_timestamp_from_state(
+    timing_state: &mut Option<TrackTimingState>,
+    current_track_timestamp: u32,
+    capture_time_us: u64,
+    duration_us: u64,
+    default_duration_us: u64,
+    clock_rate: u32,
+) -> u32 {
+    let fallback_duration_us = duration_us.max(default_duration_us).max(1);
+    let fallback_ticks = duration_to_rtp_ticks(fallback_duration_us, clock_rate);
+
+    if capture_time_us == 0 {
+        match timing_state {
+            Some(TrackTimingState::Untimed { next_rtp_timestamp }) => {
+                let packet_timestamp = *next_rtp_timestamp;
+                *next_rtp_timestamp = next_rtp_timestamp.wrapping_add(fallback_ticks);
+                packet_timestamp
+            }
+            _ => {
+                *timing_state = Some(TrackTimingState::Untimed {
+                    next_rtp_timestamp: current_track_timestamp.wrapping_add(fallback_ticks),
+                });
+                current_track_timestamp
+            }
+        }
+    } else {
+        let timing = match timing_state {
+            Some(TrackTimingState::Timed {
+                media_origin_us,
+                rtp_origin,
+            }) => (*media_origin_us, *rtp_origin),
+            _ => {
+                *timing_state = Some(TrackTimingState::Timed {
+                    media_origin_us: capture_time_us,
+                    rtp_origin: current_track_timestamp,
+                });
+                (capture_time_us, current_track_timestamp)
+            }
+        };
+        let relative_time_us = capture_time_us.saturating_sub(timing.0);
+        timing
+            .1
+            .wrapping_add(duration_to_rtp_ticks(relative_time_us, clock_rate))
     }
 }

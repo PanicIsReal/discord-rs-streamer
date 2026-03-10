@@ -18,6 +18,14 @@ pub const VIDEO_MID: &str = "1";
 pub const OPUS_PAYLOAD_TYPE: u8 = 120;
 pub const H264_PAYLOAD_TYPE: u8 = 101;
 pub const H264_RTX_PAYLOAD_TYPE: u8 = 102;
+pub const H265_PAYLOAD_TYPE: u8 = 103;
+pub const H265_RTX_PAYLOAD_TYPE: u8 = 104;
+pub const VP8_PAYLOAD_TYPE: u8 = 105;
+pub const VP8_RTX_PAYLOAD_TYPE: u8 = 106;
+pub const VP9_PAYLOAD_TYPE: u8 = 107;
+pub const VP9_RTX_PAYLOAD_TYPE: u8 = 108;
+pub const AV1_PAYLOAD_TYPE: u8 = 109;
+pub const AV1_RTX_PAYLOAD_TYPE: u8 = 110;
 const VOICE_OPCODE_READY: u8 = VoiceOpcode::Ready as u8;
 const VOICE_OPCODE_SESSION_DESCRIPTION: u8 = VoiceOpcode::SessionDescription as u8;
 const VOICE_OPCODE_HELLO: u8 = VoiceOpcode::Hello as u8;
@@ -26,6 +34,9 @@ const VOICE_OPCODE_SPEAKING: u8 = VoiceOpcode::Speaking as u8;
 const VOICE_OPCODE_RESUMED: u8 = VoiceOpcode::Resumed as u8;
 const VOICE_OPCODE_CLIENTS_CONNECT: u8 = VoiceOpcode::ClientsConnect as u8;
 const VOICE_OPCODE_CLIENT_DISCONNECT: u8 = VoiceOpcode::ClientDisconnect as u8;
+const VOICE_OPCODE_MEDIA_SINK_WANTS: u8 = VoiceOpcode::MediaSinkWants as u8;
+const VOICE_OPCODE_FLAGS: u8 = VoiceOpcode::Flags as u8;
+const VOICE_OPCODE_PLATFORM: u8 = VoiceOpcode::Platform as u8;
 const VOICE_OPCODE_DAVE_PREPARE_TRANSITION: u8 = VoiceOpcode::DavePrepareTransition as u8;
 const VOICE_OPCODE_DAVE_EXECUTE_TRANSITION: u8 = VoiceOpcode::DaveExecuteTransition as u8;
 const VOICE_OPCODE_DAVE_PREPARE_EPOCH: u8 = VoiceOpcode::DavePrepareEpoch as u8;
@@ -51,6 +62,13 @@ pub enum VoiceOpcode {
     ClientsConnect = 11,
     Video = 12,
     ClientDisconnect = 13,
+    SessionUpdate = 14,
+    MediaSinkWants = 15,
+    VoiceBackendVersion = 16,
+    ChannelOptionsUpdate = 17,
+    Flags = 18,
+    SpeedTest = 19,
+    Platform = 20,
     DavePrepareTransition = 21,
     DaveExecuteTransition = 22,
     DaveTransitionReady = 23,
@@ -136,11 +154,22 @@ pub struct SelectProtocolAck {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VoiceAuxPayload {
+    pub data: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VoiceVideoConfig {
     pub width: u32,
     pub height: u32,
     pub max_framerate: u32,
     pub max_bitrate: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SpeakingMode {
+    Mic = 1,
+    Soundshare = 2,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -162,6 +191,9 @@ pub struct VoiceSessionState {
     pub streaming_announced: bool,
     pub pending_transitions: HashMap<u16, u16>,
     pub resumed: bool,
+    pub media_sink_wants: Option<VoiceAuxPayload>,
+    pub flags: Option<VoiceAuxPayload>,
+    pub platform: Option<VoiceAuxPayload>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -243,7 +275,11 @@ where
                 "session_id": config.session_id,
                 "token": config.token,
                 "video": true,
-                "streams": [{"type":"video","rid":"100","quality":100}],
+                "streams": [{
+                    "type": identify_stream_type(config.stream_kind),
+                    "rid":"100",
+                    "quality":100
+                }],
                 "max_dave_protocol_version": config.max_dave_protocol_version,
             }
         }))
@@ -288,7 +324,11 @@ where
         }))
     }
 
-    pub fn video_command(&self, config: VoiceVideoConfig) -> Result<Value, VoiceError> {
+    pub fn video_command(
+        &self,
+        config: VoiceVideoConfig,
+        active: bool,
+    ) -> Result<Value, VoiceError> {
         let Some(ready) = self.state.ready.as_ref() else {
             return Err(VoiceError::MissingReadyStream);
         };
@@ -296,29 +336,16 @@ where
             return Err(VoiceError::MissingReadyStream);
         };
 
-        Ok(json!({
-            "op": VoiceOpcode::Video as u8,
-            "d": {
-                "audio_ssrc": ready.audio_ssrc,
-                "video_ssrc": video_stream.ssrc,
-                "rtx_ssrc": video_stream.rtx_ssrc,
-                "streams": [{
-                    "type": "video",
-                    "rid": video_stream.rid,
-                    "ssrc": video_stream.ssrc,
-                    "active": true,
-                    "quality": video_stream.quality,
-                    "rtx_ssrc": video_stream.rtx_ssrc,
-                    "max_bitrate": config.max_bitrate,
-                    "max_framerate": config.max_framerate,
-                    "max_resolution": {
-                        "type": "fixed",
-                        "width": config.width,
-                        "height": config.height,
-                    }
-                }]
-            }
-        }))
+        Ok(build_video_command(ready, video_stream, &config, active))
+    }
+
+    pub fn speaking_payload(&self, enabled: bool) -> Option<Value> {
+        let stream_kind = self
+            .config
+            .as_ref()
+            .map(|config| config.stream_kind)
+            .unwrap_or(StreamKind::Camera);
+        self.state.speaking_payload(stream_kind, enabled)
     }
 
     pub fn handle_json_message(
@@ -405,6 +432,18 @@ where
             }
             VOICE_OPCODE_RESUMED => {
                 self.state.resumed = true;
+                Ok(Vec::new())
+            }
+            VOICE_OPCODE_MEDIA_SINK_WANTS => {
+                self.state.media_sink_wants = Some(VoiceAuxPayload { data });
+                Ok(Vec::new())
+            }
+            VOICE_OPCODE_FLAGS => {
+                self.state.flags = Some(VoiceAuxPayload { data });
+                Ok(Vec::new())
+            }
+            VOICE_OPCODE_PLATFORM => {
+                self.state.platform = Some(VoiceAuxPayload { data });
                 Ok(Vec::new())
             }
             VOICE_OPCODE_HELLO | VOICE_OPCODE_HEARTBEAT_ACK | VOICE_OPCODE_SPEAKING => {
@@ -685,30 +724,25 @@ impl VoiceSessionState {
         }))
     }
 
-    pub fn video_command_payload(&self, config: &VoiceVideoConfig) -> Option<Value> {
+    pub fn video_command_payload(&self, config: &VoiceVideoConfig, active: bool) -> Option<Value> {
         let ready = self.ready.as_ref()?;
         let video_stream = find_video_stream(ready)?;
+        Some(build_video_command(ready, video_stream, config, active))
+    }
+
+    pub fn speaking_payload(&self, stream_kind: StreamKind, enabled: bool) -> Option<Value> {
+        let ready = self.ready.as_ref()?;
+        let speaking = if enabled {
+            speaking_mode_for_stream(stream_kind) as u8
+        } else {
+            0
+        };
         Some(json!({
-            "op": VoiceOpcode::Video as u8,
+            "op": VoiceOpcode::Speaking as u8,
             "d": {
-                "audio_ssrc": ready.audio_ssrc,
-                "video_ssrc": video_stream.ssrc,
-                "rtx_ssrc": video_stream.rtx_ssrc,
-                "streams": [{
-                    "type": "video",
-                    "rid": video_stream.rid,
-                    "ssrc": video_stream.ssrc,
-                    "active": true,
-                    "quality": video_stream.quality,
-                    "rtx_ssrc": video_stream.rtx_ssrc,
-                    "max_bitrate": config.max_bitrate,
-                    "max_framerate": config.max_framerate,
-                    "max_resolution": {
-                        "type": "fixed",
-                        "width": config.width,
-                        "height": config.height,
-                    }
-                }]
+                "delay": 0,
+                "speaking": speaking,
+                "ssrc": ready.audio_ssrc,
             }
         }))
     }
@@ -723,19 +757,118 @@ fn codecs() -> Vec<Value> {
         json!({
             "name": "opus",
             "type": "audio",
+            "clockRate": 48_000,
             "priority": 1000,
             "payload_type": OPUS_PAYLOAD_TYPE,
         }),
         json!({
             "name": "H264",
             "type": "video",
+            "clockRate": 90_000,
             "priority": 1000,
             "payload_type": H264_PAYLOAD_TYPE,
             "rtx_payload_type": H264_RTX_PAYLOAD_TYPE,
             "encode": true,
             "decode": true,
         }),
+        json!({
+            "name": "H265",
+            "type": "video",
+            "clockRate": 90_000,
+            "priority": 1000,
+            "payload_type": H265_PAYLOAD_TYPE,
+            "rtx_payload_type": H265_RTX_PAYLOAD_TYPE,
+            "encode": true,
+            "decode": true,
+        }),
+        json!({
+            "name": "VP8",
+            "type": "video",
+            "clockRate": 90_000,
+            "priority": 1000,
+            "payload_type": VP8_PAYLOAD_TYPE,
+            "rtx_payload_type": VP8_RTX_PAYLOAD_TYPE,
+            "encode": true,
+            "decode": true,
+        }),
+        json!({
+            "name": "VP9",
+            "type": "video",
+            "clockRate": 90_000,
+            "priority": 1000,
+            "payload_type": VP9_PAYLOAD_TYPE,
+            "rtx_payload_type": VP9_RTX_PAYLOAD_TYPE,
+            "encode": true,
+            "decode": true,
+        }),
+        json!({
+            "name": "AV1",
+            "type": "video",
+            "clockRate": 90_000,
+            "priority": 1000,
+            "payload_type": AV1_PAYLOAD_TYPE,
+            "rtx_payload_type": AV1_RTX_PAYLOAD_TYPE,
+            "encode": true,
+            "decode": true,
+        }),
     ]
+}
+
+fn identify_stream_type(stream_kind: StreamKind) -> &'static str {
+    match stream_kind {
+        StreamKind::GoLive => "screen",
+        StreamKind::Camera => "video",
+    }
+}
+
+fn speaking_mode_for_stream(stream_kind: StreamKind) -> SpeakingMode {
+    match stream_kind {
+        StreamKind::GoLive => SpeakingMode::Soundshare,
+        StreamKind::Camera => SpeakingMode::Mic,
+    }
+}
+
+fn build_video_command(
+    ready: &ReadyPayload,
+    video_stream: &StreamDescriptor,
+    config: &VoiceVideoConfig,
+    active: bool,
+) -> Value {
+    if !active {
+        return json!({
+            "op": VoiceOpcode::Video as u8,
+            "d": {
+                "audio_ssrc": ready.audio_ssrc,
+                "video_ssrc": 0,
+                "rtx_ssrc": 0,
+                "streams": []
+            }
+        });
+    }
+
+    json!({
+        "op": VoiceOpcode::Video as u8,
+        "d": {
+            "audio_ssrc": ready.audio_ssrc,
+            "video_ssrc": video_stream.ssrc,
+            "rtx_ssrc": video_stream.rtx_ssrc,
+            "streams": [{
+                "type": "video",
+                "rid": video_stream.rid,
+                "ssrc": video_stream.ssrc,
+                "active": true,
+                "quality": video_stream.quality,
+                "rtx_ssrc": video_stream.rtx_ssrc,
+                "max_bitrate": config.max_bitrate,
+                "max_framerate": config.max_framerate,
+                "max_resolution": {
+                    "type": "fixed",
+                    "width": config.width,
+                    "height": config.height,
+                }
+            }]
+        }
+    })
 }
 
 fn find_video_stream(ready: &ReadyPayload) -> Option<&StreamDescriptor> {
@@ -918,8 +1051,86 @@ mod tests {
             .expect("identify");
 
         assert_eq!(payload["op"], json!(VoiceOpcode::Identify as u8));
+        assert!(payload["d"].get("channel_id").is_none());
         assert_eq!(payload["d"]["video"], json!(true));
         assert_eq!(payload["d"]["max_dave_protocol_version"], json!(1));
+    }
+
+    #[test]
+    fn speaking_payload_uses_soundshare_for_go_live() {
+        let dave = ManagedDaveSession::new();
+        dave.initialize(DaveInitConfig {
+            protocol_version: 1,
+            user_id: 1,
+            channel_id: 2,
+            signing_private_key: None,
+            signing_public_key: None,
+        })
+        .expect("dave init");
+        let mut controller = VoiceSessionController::new(dave);
+        controller.prepare_session(
+            VoiceServerInfo {
+                endpoint: "voice.example.test".to_owned(),
+                token: "voice-token".to_owned(),
+            },
+            VoiceSessionConfig {
+                server_id: "guild-1".to_owned(),
+                channel_id: "2".to_owned(),
+                user_id: "1".to_owned(),
+                session_id: "session-1".to_owned(),
+                token: "voice-token".to_owned(),
+                stream_kind: StreamKind::GoLive,
+                max_dave_protocol_version: 1,
+            },
+        );
+        controller
+            .handle_json_message(&json!({
+                "op": VoiceOpcode::Ready as u8,
+                "d": {
+                    "ssrc": 111,
+                    "ip": "127.0.0.1",
+                    "port": 50000,
+                    "modes": ["xsalsa20_poly1305"],
+                    "streams": [{
+                        "type": "video",
+                        "rid": "100",
+                        "quality": 100,
+                        "ssrc": 222,
+                        "rtx_ssrc": 333,
+                        "active": true
+                    }]
+                }
+            }))
+            .expect("ready");
+
+        let payload = controller.speaking_payload(true).expect("speaking payload");
+        assert_eq!(payload["op"], json!(VoiceOpcode::Speaking as u8));
+        assert_eq!(payload["d"]["ssrc"], json!(111));
+        assert_eq!(payload["d"]["speaking"], json!(SpeakingMode::Soundshare as u8));
+    }
+
+    #[test]
+    fn media_sink_wants_payload_is_preserved_in_state() {
+        let mut controller = VoiceSessionController::new(ManagedDaveSession::new());
+        controller
+            .handle_json_message(&json!({
+                "op": VoiceOpcode::MediaSinkWants as u8,
+                "d": {
+                    "any": {
+                        "video": {
+                            "max_framerate": 15
+                        }
+                    }
+                }
+            }))
+            .expect("media sink wants");
+
+        let stored = controller
+            .state()
+            .media_sink_wants
+            .as_ref()
+            .expect("stored payload");
+        assert_eq!(stored.data["any"]["video"]["max_framerate"], json!(15));
     }
 
     #[test]

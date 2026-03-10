@@ -1,6 +1,47 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+wait_for_path() {
+  local label=$1
+  local path=$2
+  local timeout_seconds=$3
+  local waited=0
+
+  while [[ ! -e "${path}" ]]; do
+    if (( waited >= timeout_seconds )); then
+      echo "timed out waiting for ${label}: ${path}" >&2
+      return 1
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+}
+
+wait_for_x11_display() {
+  local display=$1
+  local timeout_seconds=$2
+  local display_number=${display#*:}
+  display_number=${display_number%%.*}
+
+  if [[ -z "${display_number}" ]]; then
+    echo "unable to determine X11 display number from ${display}" >&2
+    return 1
+  fi
+
+  wait_for_path "X11 display" "/tmp/.X11-unix/X${display_number}" "${timeout_seconds}"
+}
+
+wait_for_pulse_socket() {
+  local server=$1
+  local timeout_seconds=$2
+
+  if [[ "${server}" != unix:* ]]; then
+    return 0
+  fi
+
+  wait_for_path "Pulse socket" "${server#unix:}" "${timeout_seconds}"
+}
+
 require_env() {
   local key=$1
   if [[ -z "${!key:-}" ]]; then
@@ -25,6 +66,8 @@ VIDEO_BITRATE_KBPS="${DISCORD_RS_STREAMER_VIDEO_BITRATE_KBPS:-2500}"
 AUDIO_BITRATE_KBPS="${DISCORD_RS_STREAMER_AUDIO_BITRATE_KBPS:-128}"
 X264_PRESET="${DISCORD_RS_STREAMER_X264_PRESET:-ultrafast}"
 AUDIO_ENABLED="${DISCORD_RS_STREAMER_AUDIO_ENABLED:-true}"
+WAIT_TIMEOUT_SECONDS="${DISCORD_RS_STREAMER_WAIT_TIMEOUT_SECONDS:-60}"
+RETRY_DELAY_SECONDS="${DISCORD_RS_STREAMER_RETRY_DELAY_SECONDS:-5}"
 
 REQUIRED_ENVS=(
   DISCORD_TOKEN
@@ -68,4 +111,17 @@ else
   args+=(--no-audio)
 fi
 
-exec /usr/local/bin/discord-rs-streamer "${args[@]}"
+wait_for_x11_display "${X11_DISPLAY}" "${WAIT_TIMEOUT_SECONDS}"
+
+if [[ "${AUDIO_ENABLED}" == "true" ]]; then
+  wait_for_pulse_socket "${PULSE_SERVER:-}" "${WAIT_TIMEOUT_SECONDS}"
+fi
+
+while true; do
+  if /usr/local/bin/discord-rs-streamer "${args[@]}"; then
+    exit 0
+  fi
+
+  echo "discord-rs-streamer exited; retrying in ${RETRY_DELAY_SECONDS}s" >&2
+  sleep "${RETRY_DELAY_SECONDS}"
+done

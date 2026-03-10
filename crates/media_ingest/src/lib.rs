@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::io::{AsyncRead, AsyncReadExt, stdin};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, stdin};
 use tokio::net::UnixListener;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -25,14 +25,48 @@ pub enum IngestProtocol {
     Framed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ChunkTiming {
+    pub capture_time_us: u64,
+    pub duration_us: u64,
+    pub is_keyframe: bool,
+}
+
+impl ChunkTiming {
+    pub fn with_duration(duration_us: u64) -> Self {
+        Self {
+            duration_us,
+            ..Self::default()
+        }
+    }
+
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IngestChunk {
     pub kind: MediaKind,
     pub payload: Bytes,
+    #[serde(default)]
+    pub timing: ChunkTiming,
 }
 
 pub const DEFAULT_CHUNK_SIZE: usize = 16 * 1024;
 pub const MAX_FRAMED_PACKET_SIZE: usize = 8 * 1024 * 1024;
+
+const TIMED_FRAME_MAGIC: [u8; 4] = *b"DRSF";
+const TIMED_FRAME_MAGIC_LEN: usize = 4;
+const TIMED_FRAME_VERSION: u8 = 1;
+const TIMED_FRAME_VERSION_INDEX: usize = TIMED_FRAME_MAGIC_LEN;
+const TIMED_FRAME_KIND_INDEX: usize = TIMED_FRAME_VERSION_INDEX + 1;
+const TIMED_FRAME_FLAGS_INDEX: usize = TIMED_FRAME_KIND_INDEX + 1;
+const TIMED_FRAME_CAPTURE_TIME_INDEX: usize = TIMED_FRAME_FLAGS_INDEX + 1;
+const TIMED_FRAME_DURATION_INDEX: usize = TIMED_FRAME_CAPTURE_TIME_INDEX + 8;
+const TIMED_FRAME_HEADER_LEN: usize =
+    TIMED_FRAME_DURATION_INDEX + 8;
+const TIMED_FRAME_FLAG_KEYFRAME: u8 = 1 << 0;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UnixSocketSourceConfig {
@@ -81,6 +115,10 @@ pub enum IngestError {
     Io(#[from] io::Error),
     #[error("framed packet length {0} exceeds maximum {MAX_FRAMED_PACKET_SIZE}")]
     FrameTooLarge(usize),
+    #[error("timed frame version {0} is not supported")]
+    UnsupportedFrameVersion(u8),
+    #[error("timed frame media kind {0} did not match expected {1:?}")]
+    FrameKindMismatch(u8, MediaKind),
 }
 
 pub struct UnixSocketIngestServer {
@@ -142,6 +180,44 @@ pub fn spawn_stdin_ingest(
     })
 }
 
+pub async fn write_framed_chunk<W>(
+    writer: &mut W,
+    chunk: &IngestChunk,
+) -> Result<(), IngestError>
+where
+    W: AsyncWrite + Unpin,
+{
+    let payload = encode_framed_payload(chunk);
+    let payload_len = payload.len();
+    if payload_len > MAX_FRAMED_PACKET_SIZE {
+        return Err(IngestError::FrameTooLarge(payload_len));
+    }
+
+    writer.write_all(&(payload_len as u32).to_be_bytes()).await?;
+    writer.write_all(&payload).await?;
+    Ok(())
+}
+
+pub fn encode_framed_payload(chunk: &IngestChunk) -> Vec<u8> {
+    if chunk.timing.is_default() {
+        return chunk.payload.to_vec();
+    }
+
+    let mut framed = Vec::with_capacity(TIMED_FRAME_HEADER_LEN + chunk.payload.len());
+    framed.extend_from_slice(&TIMED_FRAME_MAGIC);
+    framed.push(TIMED_FRAME_VERSION);
+    framed.push(encode_media_kind(chunk.kind));
+    framed.push(if chunk.timing.is_keyframe {
+        TIMED_FRAME_FLAG_KEYFRAME
+    } else {
+        0
+    });
+    framed.extend_from_slice(&chunk.timing.capture_time_us.to_be_bytes());
+    framed.extend_from_slice(&chunk.timing.duration_us.to_be_bytes());
+    framed.extend_from_slice(&chunk.payload);
+    framed
+}
+
 async fn run_listener(
     kind: MediaKind,
     listener: UnixListener,
@@ -182,8 +258,11 @@ where
 
         send_chunk(
             &sender,
-            kind,
-            Bytes::copy_from_slice(&buffer[..bytes_read]).to_vec(),
+            IngestChunk {
+                kind,
+                payload: Bytes::copy_from_slice(&buffer[..bytes_read]),
+                timing: ChunkTiming::default(),
+            },
         )
         .await?;
     }
@@ -215,20 +294,78 @@ where
 
         let mut payload = vec![0_u8; frame_len];
         reader.read_exact(&mut payload).await?;
-        send_chunk(&sender, kind, payload).await?;
+        let chunk = decode_framed_payload(kind, payload)?;
+        send_chunk(&sender, chunk).await?;
+    }
+}
+
+fn decode_framed_payload(expected_kind: MediaKind, payload: Vec<u8>) -> Result<IngestChunk, IngestError> {
+    if payload.len() < TIMED_FRAME_HEADER_LEN || !payload.starts_with(&TIMED_FRAME_MAGIC) {
+        return Ok(IngestChunk {
+            kind: expected_kind,
+            payload: Bytes::from(payload),
+            timing: ChunkTiming::default(),
+        });
+    }
+
+    let version = payload[4];
+    if version != TIMED_FRAME_VERSION {
+        return Err(IngestError::UnsupportedFrameVersion(version));
+    }
+
+    let encoded_kind = payload[TIMED_FRAME_KIND_INDEX];
+    let kind = decode_media_kind(encoded_kind).ok_or(IngestError::FrameKindMismatch(
+        encoded_kind,
+        expected_kind,
+    ))?;
+    if kind != expected_kind {
+        return Err(IngestError::FrameKindMismatch(encoded_kind, expected_kind));
+    }
+
+    let flags = payload[TIMED_FRAME_FLAGS_INDEX];
+    let capture_time_us = u64::from_be_bytes(
+        payload[TIMED_FRAME_CAPTURE_TIME_INDEX..TIMED_FRAME_DURATION_INDEX]
+            .try_into()
+            .expect("slice"),
+    );
+    let duration_us = u64::from_be_bytes(
+        payload[TIMED_FRAME_DURATION_INDEX..TIMED_FRAME_HEADER_LEN]
+            .try_into()
+            .expect("slice"),
+    );
+
+    Ok(IngestChunk {
+        kind,
+        payload: Bytes::from(payload[TIMED_FRAME_HEADER_LEN..].to_vec()),
+        timing: ChunkTiming {
+            capture_time_us,
+            duration_us,
+            is_keyframe: flags & TIMED_FRAME_FLAG_KEYFRAME != 0,
+        },
+    })
+}
+
+fn encode_media_kind(kind: MediaKind) -> u8 {
+    match kind {
+        MediaKind::Video => 0,
+        MediaKind::Audio => 1,
+    }
+}
+
+fn decode_media_kind(encoded: u8) -> Option<MediaKind> {
+    match encoded {
+        0 => Some(MediaKind::Video),
+        1 => Some(MediaKind::Audio),
+        _ => None,
     }
 }
 
 async fn send_chunk(
     sender: &mpsc::Sender<IngestChunk>,
-    kind: MediaKind,
-    payload: Vec<u8>,
+    chunk: IngestChunk,
 ) -> Result<(), IngestError> {
     sender
-        .send(IngestChunk {
-            kind,
-            payload: Bytes::from(payload),
-        })
+        .send(chunk)
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "ingest channel closed"))?;
     Ok(())
@@ -332,6 +469,52 @@ mod tests {
 
         assert_eq!(first.payload, Bytes::from_static(b"abcd"));
         assert_eq!(second.payload, Bytes::from_static(b"ef"));
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn framed_ingest_decodes_timed_metadata() {
+        let temp = tempdir().expect("tempdir");
+        let video = temp.path().join("video.sock");
+        let (tx, mut rx) = mpsc::channel(8);
+
+        let server = UnixSocketIngestServer::bind(
+            UnixSocketSourceConfig {
+                video_socket: video.clone(),
+                audio_socket: None,
+                read_chunk_size: 16,
+                protocol: IngestProtocol::Framed,
+            },
+            tx,
+        )
+        .await
+        .expect("bind");
+
+        let mut video_stream = UnixStream::connect(video).await.expect("video connect");
+        write_framed_chunk(
+            &mut video_stream,
+            &IngestChunk {
+                kind: MediaKind::Video,
+                payload: Bytes::from_static(b"frame"),
+                timing: ChunkTiming {
+                    capture_time_us: 42,
+                    duration_us: 66_666,
+                    is_keyframe: true,
+                },
+            },
+        )
+        .await
+        .expect("write");
+
+        let chunk = timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("receive")
+            .expect("chunk");
+
+        assert_eq!(chunk.payload, Bytes::from_static(b"frame"));
+        assert_eq!(chunk.timing.capture_time_us, 42);
+        assert_eq!(chunk.timing.duration_us, 66_666);
+        assert!(chunk.timing.is_keyframe);
         server.shutdown().await;
     }
 
